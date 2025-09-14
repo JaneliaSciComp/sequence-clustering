@@ -1,3 +1,4 @@
+import time
 import argparse
 
 def generate_neighbors(seq, include_next_nearest=False):
@@ -184,5 +185,7 @@ def main():
     print("Done!")
 
 if __name__ == "__main__":
+    start = time.time()
     main()
-
+    end = time.time()
+    print(f"Total time taken: {end - start:.3g} seconds")
