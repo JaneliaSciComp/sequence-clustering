@@ -1,6 +1,5 @@
 import time
 import argparse
-import gc
 import numpy as np
 import faiss
 
@@ -9,27 +8,194 @@ _BASE2IDX = np.full(256, -1, dtype=np.int8)
 for i, b in enumerate(b"ACGT"):
     _BASE2IDX[b] = i
 
-def encode_onehot_4bit(seq: str) -> np.ndarray:
-    """Return packed binary code (uint8 array) with 4 bits per nucleotide.
-       Exactly 1 bit set per position; length = 4*L bits, padded to multiple of 8."""
-    s = np.frombuffer(seq.strip().upper().encode("ascii"), dtype=np.uint8)
-    idx = _BASE2IDX[s]
-    if np.any(idx < 0):
-        raise ValueError("Only A/C/G/T are allowed")
-    L = len(idx)
-    nbits = 4 * L
-    # Pad to multiple of 8 bits for FAISS binary index compatibility
-    nbits_padded = ((nbits + 7) // 8) * 8
-    nbytes = nbits_padded // 8
-    code = np.zeros(nbytes, dtype=np.uint8)
+def encode_batch_onehot_4bit(sequences: list) -> dict:
+    """Encode multiple sequences into binary codes, grouped by length.
+    
+    Args:
+        sequences: List of sequence strings
+        
+    Returns:
+        dict: {length: (codes_array, indices)} where codes_array is (N, d_bytes) 
+              and indices maps back to original sequence positions
+    """
+    # Group sequences by length
+    length_groups = {}
+    for seq_idx, seq in enumerate(sequences):
+        s = seq.strip().upper()
+        L = len(s)
+        if L not in length_groups:
+            length_groups[L] = {'sequences': [], 'indices': []}
+        length_groups[L]['sequences'].append(s)
+        length_groups[L]['indices'].append(seq_idx)
+    
+    # Encode each length group
+    result = {}
+    for L, group in length_groups.items():
+        if L == 0:
+            continue
+            
+        seqs = group['sequences']
+        n_seqs = len(seqs)
+        
+        # Calculate dimensions
+        nbits = 4 * L
+        d_bits = ((nbits + 7) // 8) * 8  # Round up to multiple of 8
+        d_bytes = d_bits // 8
+        
+        # Pre-allocate output array
+        codes = np.zeros((n_seqs, d_bytes), dtype=np.uint8)
+        
+        # Convert all sequences to byte arrays
+        seq_bytes = np.array([list(seq.encode('ascii')) for seq in seqs], dtype=np.uint8)
+        
+        # Vectorized base to index conversion
+        indices = _BASE2IDX[seq_bytes]  # Shape: (n_seqs, L)
+        
+        # Check for invalid bases
+        invalid_mask = indices < 0
+        if np.any(invalid_mask):
+            invalid_seqs = np.any(invalid_mask, axis=1)
+            # Remove invalid sequences
+            valid_mask = ~invalid_seqs
+            indices = indices[valid_mask]
+            group['indices'] = [group['indices'][i] for i in range(n_seqs) if valid_mask[i]]
+            codes = codes[valid_mask]
+            n_seqs = np.sum(valid_mask)
+            
+        if n_seqs == 0:
+            continue
+            
+        # Vectorized bit position calculation
+        # For each sequence, calculate bit indices: 4*position + base_index
+        pos_array = np.arange(L, dtype=np.int64)  # [0, 1, 2, ..., L-1]
+        bit_indices = 4 * pos_array[None, :] + indices.astype(np.int64)  # Shape: (n_seqs, L)
+        
+        # Calculate byte and bit positions
+        byte_pos = bit_indices >> 3  # Divide by 8
+        bit_pos = bit_indices & 7    # Modulo 8
+        
+        # Vectorized bit setting
+        seq_indices = np.arange(n_seqs)[:, None]  # Shape: (n_seqs, 1)
+        codes[seq_indices, byte_pos] |= (1 << bit_pos).astype(np.uint8)
+        
+        result[L] = {
+            'codes': codes,
+            'indices': group['indices'],
+            'd_bits': d_bits
+        }
+    
+    return result
 
-    # For position p with base index k in {0,1,2,3}, set bit at bidx = 4*p + k
-    bidx = 4 * np.arange(L, dtype=np.int64) + idx.astype(np.int64)
-
-    byte_pos = bidx >> 3
-    bit_pos  = bidx & 7
-    code[byte_pos] |= (1 << bit_pos).astype(np.uint8)
-    return code
+def cluster_sequences_vectorized(sequences: list, headers: list, include_next_nearest=False):
+    """Vectorized clustering of sequences using FAISS.
+    
+    Args:
+        sequences: List of sequence strings
+        headers: List of corresponding headers
+        include_next_nearest: If True, cluster with up to 2 mismatches
+        
+    Returns:
+        dict: cluster_id -> cluster_info
+    """
+    max_hamming = 4 if include_next_nearest else 2
+    hamming_check = hamming_leq2_nt if include_next_nearest else hamming_leq1_nt
+    
+    # Encode all sequences grouped by length
+    encoded_groups = encode_batch_onehot_4bit(sequences)
+    
+    cluster_data = {}
+    cluster_id_counter = 0
+    
+    # Process each length group
+    for L, group_data in encoded_groups.items():
+        codes = group_data['codes']
+        seq_indices = group_data['indices']
+        d_bits = group_data['d_bits']
+        n_seqs = len(codes)
+        
+        if n_seqs == 0:
+            continue
+            
+        print(f"Processing {n_seqs} sequences of length {L}")
+        
+        # Create FAISS index - use MIH for better performance on radius searches
+        try:
+            # IndexBinaryMultiHash(d, nhash, bits_per_hash) where:
+            # d = dimension in bits
+            # nhash = number of hash tables (typically 4-8)
+            # bits_per_hash = bits per hash table (typically d/nhash or close to it)
+            nhash = min(8, max(4, d_bits // 32))  # Adaptive number of hash tables
+            bits_per_hash = d_bits // nhash  # Bits per hash table
+            index = faiss.IndexBinaryMultiHash(d_bits, nhash, bits_per_hash)
+            print(f"  Using MIH with {nhash} hash tables, {bits_per_hash} bits each")
+        except (RuntimeError, ValueError) as e:
+            # Fall back to flat index if MIH fails
+            print(f"  MIH failed ({e}), using flat index")
+            index = faiss.IndexBinaryFlat(d_bits)
+        
+        # Track which sequences are representatives vs clustered
+        cluster_assignments = np.full(n_seqs, -1, dtype=np.int32)  # -1 means unassigned
+        representatives = []  # List of (rep_seq_idx, cluster_id)
+        
+        for seq_idx in range(n_seqs):
+            if cluster_assignments[seq_idx] != -1:
+                continue  # Already assigned
+                
+            orig_seq_idx = seq_indices[seq_idx]
+            seq = sequences[orig_seq_idx]
+            header = headers[orig_seq_idx]
+            
+            if index.ntotal == 0:
+                # First sequence of this length - becomes a representative
+                index.add(codes[seq_idx:seq_idx+1])
+                cluster_id = cluster_id_counter
+                cluster_id_counter += 1
+                
+                representatives.append((seq_idx, cluster_id))
+                cluster_assignments[seq_idx] = cluster_id
+                
+                cluster_data[cluster_id] = {
+                    'sequences': {seq: {'count': 1, 'header': header}},
+                    'total_count': 1
+                }
+            else:
+                # Search for nearest neighbor
+                D, I = index.search(codes[seq_idx:seq_idx+1], k=1)
+                d0 = int(D[0, 0])
+                i0 = int(I[0, 0])
+                
+                if i0 != -1 and d0 <= max_hamming:
+                    # Get the representative sequence index and cluster ID
+                    rep_seq_idx, cluster_id = representatives[i0]
+                    rep_orig_idx = seq_indices[rep_seq_idx]
+                    rep_seq = sequences[rep_orig_idx]
+                    
+                    # Verify with nucleotide-level Hamming distance
+                    if hamming_check(seq, rep_seq):
+                        # Assign to existing cluster
+                        cluster_assignments[seq_idx] = cluster_id
+                        
+                        if seq in cluster_data[cluster_id]['sequences']:
+                            cluster_data[cluster_id]['sequences'][seq]['count'] += 1
+                        else:
+                            cluster_data[cluster_id]['sequences'][seq] = {'count': 1, 'header': header}
+                        cluster_data[cluster_id]['total_count'] += 1
+                        continue
+                
+                # Create new cluster (new representative)
+                index.add(codes[seq_idx:seq_idx+1])
+                cluster_id = cluster_id_counter
+                cluster_id_counter += 1
+                
+                representatives.append((seq_idx, cluster_id))
+                cluster_assignments[seq_idx] = cluster_id
+                
+                cluster_data[cluster_id] = {
+                    'sequences': {seq: {'count': 1, 'header': header}},
+                    'total_count': 1
+                }
+    
+    return cluster_data
 
 # ---------- Exact Hamming check on nucleotides (fast, short-circuit) ----------
 def hamming_leq2_nt(seq_a: str, seq_b: str) -> bool:
@@ -66,76 +232,9 @@ def is_valid_sequence(seq):
     """
     return all(c in 'ACGT' for c in seq)
 
-# ---------- FAISS-based clustering for pipeline integration ----------
-class FaissClustering:
-    """
-    FAISS-based clustering that maintains cluster information compatible with the pipeline.
-    """
-    def __init__(self, include_next_nearest=False):
-        self.include_next_nearest = include_next_nearest
-        self.max_hamming = 4 if include_next_nearest else 2  # 2 nt diff = 4 bit diff in one-hot
-        self._perL = {}   # L -> dict(index=faiss.IndexBinary*, sequences=[dict])
-        
-    def _get_index_for_L(self, L: int):
-        entry = self._perL.get(L)
-        if entry is not None:
-            return entry
-        # Calculate bits and ensure it's a multiple of 8 for FAISS binary index
-        nbits = 4 * L
-        d_bits = ((nbits + 7) // 8) * 8  # Round up to nearest multiple of 8
-        # Use flat binary index for simplicity and reliability
-        index = faiss.IndexBinaryFlat(d_bits)
-        entry = {"index": index, "sequences": []}
-        self._perL[L] = entry
-        return entry
-
-    def process_sequence(self, seq: str, header: str):
-        """
-        Process one sequence and assign it to a cluster.
-        Returns the cluster index or creates a new one.
-        """
-        s = seq.strip().upper()
-        L = len(s)
-        if L == 0:
-            return None
-            
-        entry = self._get_index_for_L(L)
-        index = entry["index"]
-        sequences = entry["sequences"]
-
-        code = encode_onehot_4bit(s)[None, :]  # shape (1, d_bits/8)
-
-        if index.ntotal > 0:
-            # Find nearest neighbor
-            D, I = index.search(code, k=1)
-            d0 = int(D[0, 0])
-            i0 = int(I[0, 0])
-            
-            if i0 != -1 and d0 <= self.max_hamming:
-                # Verify on nucleotides to guard against rare bit collisions
-                rep_seq = sequences[i0]['representative']
-                hamming_check = hamming_leq2_nt if self.include_next_nearest else hamming_leq1_nt
-                
-                if hamming_check(s, rep_seq):
-                    # Add to existing cluster
-                    cluster_idx = (L, i0)  # Use (length, index) as cluster identifier
-                    return cluster_idx
-
-        # Create new cluster (new representative)
-        new_idx = len(sequences)
-        sequences.append({
-            'representative': s,
-            'sequences': {},
-            'total_count': 0
-        })
-        index.add(code)
-        
-        cluster_idx = (L, new_idx)
-        return cluster_idx
-
 def cluster_sequences(fastq_file, include_next_nearest=False):
     """
-    FAISS-based clustering of sequences from FASTQ file.
+    Vectorized FAISS-based clustering of sequences from FASTQ file.
 
     Args:
         fastq_file (str): Path to the FASTQ file.
@@ -144,13 +243,13 @@ def cluster_sequences(fastq_file, include_next_nearest=False):
     Returns:
         list: List of clusters, each containing sequences and their info.
     """
-    clusterer = FaissClustering(include_next_nearest)
-    cluster_data = {}  # cluster_idx -> cluster info
-    
-    # Statistics
+    # Load all sequences and headers into memory first
+    sequences = []
+    headers = []
     skipped_sequences = 0
     processed_sequences = 0
 
+    print("Loading sequences...")
     with open(fastq_file, 'r', encoding='utf-8') as f:
         while True:
             header_line = f.readline().strip()
@@ -168,39 +267,22 @@ def cluster_sequences(fastq_file, include_next_nearest=False):
                 skipped_sequences += 1
                 continue
 
+            sequences.append(seq)
+            headers.append(header)
             processed_sequences += 1
 
-            # Progress reporting
+            # Progress reporting during loading
             if processed_sequences % 100000 == 0:
-                print(f"Processed {processed_sequences:,} sequences, {len(cluster_data)} clusters")
-                # Force garbage collection periodically
-                gc.collect()
+                print(f"Loaded {processed_sequences:,} sequences...")
 
-            try:
-                cluster_idx = clusterer.process_sequence(seq, header)
-                if cluster_idx is None:
-                    continue
-                    
-                # Initialize cluster if new
-                if cluster_idx not in cluster_data:
-                    cluster_data[cluster_idx] = {
-                        'sequences': {},
-                        'total_count': 0
-                    }
-                
-                # Add sequence to cluster
-                if seq in cluster_data[cluster_idx]['sequences']:
-                    cluster_data[cluster_idx]['sequences'][seq]['count'] += 1
-                else:
-                    cluster_data[cluster_idx]['sequences'][seq] = {'count': 1, 'header': header}
-                cluster_data[cluster_idx]['total_count'] += 1
-                
-            except ValueError:
-                # Skip sequences that can't be encoded (shouldn't happen with valid sequences)
-                skipped_sequences += 1
-
-    print(f"Processed {processed_sequences:,} valid sequences")
+    print(f"Loaded {processed_sequences:,} valid sequences")
     print(f"Skipped {skipped_sequences:,} sequences with invalid characters")
+    
+    if not sequences:
+        return []
+
+    print("Starting vectorized clustering...")
+    cluster_data = cluster_sequences_vectorized(sequences, headers, include_next_nearest)
 
     # Convert to list format expected by write function
     clusters = list(cluster_data.values())

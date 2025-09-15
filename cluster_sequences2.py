@@ -1,3 +1,4 @@
+import time
 import argparse
 import gc
 
@@ -192,5 +193,6 @@ def main():
     print("Done!")
 
 if __name__ == "__main__":
+    start = time.time()
     main()
-
+    print(f"Total time taken: {time.time() - start:.3g} seconds")
