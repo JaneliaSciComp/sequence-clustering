@@ -1,6 +1,10 @@
 import time
 import argparse
-import gc
+
+import numpy as np
+
+
+INVALID_NUCLEOTIDE = 255  # Using uint8, so 255 is a convenient invalid value
 
 def generate_neighbors(seq, include_next_nearest=False):
     """
@@ -35,17 +39,61 @@ def generate_neighbors(seq, include_next_nearest=False):
                                 neighbor[j] = nuc2
                                 yield ''.join(neighbor)
 
-def is_valid_sequence(seq):
+
+def is_valid_sequence(seq: str) -> bool:
     """
     Check if sequence contains only valid nucleotides (A, G, C, T).
 
-    Args:
-        seq (str): The sequence to check.
-
-    Returns:
-        bool: True if sequence contains only A, G, C, T.
+    :param seq: The sequence to check.
+    :returns: True if sequence contains only A, G, C, T.
     """
     return all(c in 'ATCG' for c in seq)
+
+
+def read_sequences(fastq_file: str) -> tuple[list[str], np.ndarray, int]:
+    """
+    Generator to read sequences from a FASTQ file.
+
+    :param fastq_file: Path to the FASTQ file.
+    :returns: A tuple containing the header and sequence.
+    """
+    headers = []
+    sequences = []
+    skipped = 0
+
+    with open(fastq_file, 'r', encoding='ascii') as f:
+        while True:
+            header_line = f.readline().strip()
+            if not header_line:
+                break
+            header_line = header_line[1:] if header_line.startswith('@') else header_line
+            seq = f.readline().strip()
+
+            f.readline()  # Skip '+' line
+            f.readline()  # Skip quality line
+
+            if not is_valid_sequence(seq):
+                skipped += 1
+                continue
+
+            headers.append(header_line)
+            sequences.append(seq)
+
+    # Map nucleotides to integers: A=0, T=1, C=2, G=3
+    nuc_map = np.full(255, INVALID_NUCLEOTIDE, dtype='uint8')
+    for i, c in enumerate('ATCG'):
+        nuc_map[ord(c)] = i
+
+    # Convert to numpy array for efficient processing
+    max_len = max(len(s) for s in sequences)
+    seq_array = np.full((len(sequences), max_len), INVALID_NUCLEOTIDE, dtype='uint8')
+
+    for idx, s in enumerate(sequences):
+        arr = np.frombuffer(s.encode('ascii', 'strict'), dtype='uint8')
+        seq_array[idx, :len(arr)] = nuc_map[arr]
+
+    return headers, seq_array, skipped
+
 
 def cluster_sequences(fastq_file, include_next_nearest=False):
     """
@@ -99,8 +147,6 @@ def cluster_sequences(fastq_file, include_next_nearest=False):
             # Progress reporting
             if processed_sequences % 1000000 == 0:
                 print(f"Processed {processed_sequences:,} sequences, {len(clusters)} clusters")
-                # Force garbage collection periodically
-                gc.collect()
 
             # Check if this exact sequence is already assigned to a cluster
             if seq in seq_to_cluster:
@@ -143,6 +189,7 @@ def cluster_sequences(fastq_file, include_next_nearest=False):
 
     return clusters
 
+
 def write_clustered_fasta(clusters, output_file):
     """
     Write clustered sequences to FASTA file.
@@ -165,7 +212,8 @@ def write_clustered_fasta(clusters, output_file):
 
             f.write(f">{header} N:{total_count}\n{seq}\n")
 
-def main():
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Memory-optimized clustering of FASTQ sequences.'
     )
@@ -184,15 +232,21 @@ def main():
     else:
         print("Using nearest neighbors only (up to 1 mismatch)")
 
+    start = time.time()
+    headers, sequences, skipped = read_sequences(args.input)
+    read_time = time.time()
+    print(f"Read {len(sequences):,} sequences in {read_time - start:.3g} seconds")
+
     clusters = cluster_sequences(args.input, args.include_next_nearest)
+    cluster_time = time.time()
+    print(f"Clustering took: {cluster_time - read_time:.3g} seconds")
 
     print(f"Found {len(clusters):,} clusters")
     print(f"Writing clustered sequences to: {args.output}")
     write_clustered_fasta(clusters, args.output)
+    write_time = time.time()
+    print(f"Writing took: {write_time - cluster_time:.3g} seconds")
 
     print("Done!")
 
-if __name__ == "__main__":
-    start = time.time()
-    main()
     print(f"Total time taken: {time.time() - start:.3g} seconds")
