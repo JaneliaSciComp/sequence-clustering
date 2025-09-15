@@ -235,17 +235,26 @@ if __name__ == "__main__":
     start = time.time()
     headers, sequences, skipped = read_sequences(args.input)
     read_time = time.time()
-    print(f"Read {len(sequences):,} sequences in {read_time - start:.3g} seconds")
+    print(
+        f"Read {len(sequences):,} sequences (skipping {skipped:,}) "
+        f"in {read_time - start:.3g} seconds"
+    )
 
-    clusters = cluster_sequences(args.input, args.include_next_nearest)
-    cluster_time = time.time()
-    print(f"Clustering took: {cluster_time - read_time:.3g} seconds")
+    sequences, idx, counts = np.unique(sequences, axis=0, return_counts=True, return_index=True)
+    headers = [headers[i] for i in idx]
+    dedup_time = time.time()
+    print(f"Found {len(sequences):,} unique sequences in {dedup_time - read_time:.3g} seconds")
 
-    print(f"Found {len(clusters):,} clusters")
-    print(f"Writing clustered sequences to: {args.output}")
-    write_clustered_fasta(clusters, args.output)
-    write_time = time.time()
-    print(f"Writing took: {write_time - cluster_time:.3g} seconds")
+
+    # clusters = cluster_sequences(args.input, args.include_next_nearest)
+    # cluster_time = time.time()
+    # print(f"Clustering took: {cluster_time - read_time:.3g} seconds")
+
+    # print(f"Found {len(clusters):,} clusters")
+    # print(f"Writing clustered sequences to: {args.output}")
+    # write_clustered_fasta(clusters, args.output)
+    # write_time = time.time()
+    # print(f"Writing took: {write_time - cluster_time:.3g} seconds")
 
     print("Done!")
 
