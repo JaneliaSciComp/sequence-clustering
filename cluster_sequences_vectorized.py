@@ -95,16 +95,13 @@ def read_sequences(fastq_file: str) -> tuple[list[str], np.ndarray, int]:
     return headers, seq_array, skipped
 
 
-def cluster_sequences(fastq_file, include_next_nearest=False):
+def cluster_sequences(fastq_file: str, include_next_nearest: bool = False) -> list[dict]:
     """
     Memory-optimized clustering of sequences from FASTQ file.
 
-    Args:
-        fastq_file (str): Path to the FASTQ file.
-        include_next_nearest (bool): If True, cluster with up to 2 mismatches.
-
-    Returns:
-        list: List of clusters, each containing sequences and their info.
+    :param fastq_file: Path to the FASTQ file.
+    :param include_next_nearest: If True, cluster with up to 2 mismatches.
+    :returns: List of clusters, each containing sequences and their info.
     """
     # Only store actual sequences seen, not all possible neighbors
     seq_to_cluster = {}
@@ -236,15 +233,18 @@ if __name__ == "__main__":
     headers, sequences, skipped = read_sequences(args.input)
     read_time = time.time()
     print(
-        f"Read {len(sequences):,} sequences (skipping {skipped:,}) "
-        f"in {read_time - start:.3g} seconds"
+        f"Read {len(sequences):,} sequences of length {sequences.shape[1]} "
+        f"(skipping {skipped:,}) in {read_time - start:.3g} seconds"
     )
 
     sequences, idx, counts = np.unique(sequences, axis=0, return_counts=True, return_index=True)
+    perm = np.argsort(counts)[::-1]
+    sequences = sequences[perm]
+    counts = counts[perm]
+    idx = idx[perm]
     headers = [headers[i] for i in idx]
     dedup_time = time.time()
     print(f"Found {len(sequences):,} unique sequences in {dedup_time - read_time:.3g} seconds")
-
 
     # clusters = cluster_sequences(args.input, args.include_next_nearest)
     # cluster_time = time.time()
