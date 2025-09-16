@@ -1,17 +1,48 @@
 import time
 import argparse
 from dataclasses import dataclass
+from collections import defaultdict
 
-import numpy as np
-
-
-INVALID_NUCLEOTIDE = 255  # Using uint8, so 255 is a convenient invalid value
 
 @dataclass
 class UniqueSequence:
+    """
+    A unique sequence with the number of duplicate reads and header info of
+    one of the reads.
+    """
     sequence: str
     count: int
     header: str
+
+
+@dataclass
+class Cluster:
+    """
+    A cluster of similar sequences.
+    """
+    representative: UniqueSequence
+    members: list[UniqueSequence]
+
+    @property
+    def total_count(self) -> int:
+        """Return the total count of sequences in the cluster."""
+        return sum(member.count for member in self.members) + self.representative.count
+
+    def absorb(self, other: 'Cluster'):
+        """Absorb another cluster into this one."""
+        self.members.append(other.representative)
+        self.members.extend(other.members)
+
+        other.members.clear()
+        other.representative = None  # type: ignore
+
+    def __len__(self) -> int:
+        return 1 + len(self.members)
+
+    def __iter__(self):
+        yield self.representative
+        yield from self.members
+
 
 def generate_neighbors(seq, include_next_nearest=False):
     """
@@ -59,14 +90,14 @@ def is_valid_sequence(seq: str) -> bool:
 
 def read_sequences(fastq_file: str) -> tuple[dict[int, list[UniqueSequence]], int]:
     """
-    Generator to read sequences from a FASTQ file.
+    Read unique sequences from a FASTQ file.
 
     :param fastq_file: Path to the FASTQ file.
     :returns: A tuple containing the unique sequences separated by length, the
         total count of processed sequences, and the count of skipped invalid
         sequences.
     """
-    sequences = {}
+    sequences = defaultdict(dict)  # length -> {sequence: UniqueSequence}
     total = 0
     skipped = 0
 
@@ -85,11 +116,7 @@ def read_sequences(fastq_file: str) -> tuple[dict[int, list[UniqueSequence]], in
                 continue
             total += 1
 
-            seqlen = len(seq)
-            if seqlen not in sequences:
-                sequences[seqlen] = {}
-            sequences_for_length = sequences[seqlen]
-
+            sequences_for_length = sequences[len(seq)]
             if seq in sequences_for_length:
                 sequences_for_length[seq].count += 1
             else:
@@ -104,110 +131,78 @@ def read_sequences(fastq_file: str) -> tuple[dict[int, list[UniqueSequence]], in
     return sequences, total, skipped
 
 
-def sequences_to_numpy(sequences: list[UniqueSequence]) -> tuple[np.ndarray, np.ndarray]:
+def generate_partitions(n: int, k: int) -> list[tuple[int, int]]:
     """
-    Convert list of UniqueSequence to a numpy array representation.
+    Partition n items into k contiguous sets of roughly equal size.
 
-    :param sequences: List of UniqueSequence objects.
-    :returns: A tuple containing a 2D numpy array of sequences and a 1D array of counts.
+    :param n: Total number of items.
+    :param k: Number of subsets.
+    :returns: A list of all partitions.
     """
-    sequences = [
-        np.frombuffer(s.sequence.encode("ascii", "strict"), dtype="uint8")
-        for s in sequences
-    ]
-    counts = np.array([s.count for s in sequences], dtype='int64')
+    base_size = n // k
+    remainder = n % k
 
-    return np.array(sequences, dtype='uint8'), counts
+    partitions = []
+    start = 0
+    for i in range(k):
+        size = base_size + (1 if i < remainder else 0)
+        end = start + size
+        partitions.append((start, end))
+        start = end
+
+    return partitions
 
 
-def cluster_sequences(fastq_file: str, include_next_nearest: bool = False) -> list[dict]:
+def are_sequences_similar(seq1: str, seq2: str, n_edits: int) -> bool:
     """
-    Memory-optimized clustering of sequences from FASTQ file.
+    Check if two sequences are similar within a given number of edits (Hamming distance).
 
-    :param fastq_file: Path to the FASTQ file.
-    :param include_next_nearest: If True, cluster with up to 2 mismatches.
-    :returns: List of clusters, each containing sequences and their info.
+    :param seq1: First sequence.
+    :param seq2: Second sequence.
+    :param n_edits: Maximum number of allowed edits.
+    :returns: True if sequences are similar within n_edits, False otherwise.
     """
-    # Only store actual sequences seen, not all possible neighbors
-    seq_to_cluster = {}
-    # List of actual sequences in each cluster (for neighbor checking)
-    cluster_sequences = []
-    # Cluster metadata
-    clusters = []
-    # Counter for generating unique cluster IDs
-    next_cluster_id = 0
-    # Statistics
-    skipped_sequences = 0
-    processed_sequences = 0
+    differences = sum(c1 != c2 for c1, c2 in zip(seq1, seq2))
+    return differences <= n_edits
 
-    def find_matching_cluster(seq):
-        """Find if sequence matches any existing cluster within distance threshold."""
-        for neighbor in generate_neighbors(seq, include_next_nearest):
-            if neighbor in seq_to_cluster:
-                return seq_to_cluster[neighbor]
-        return None
 
-    with open(fastq_file, 'r') as f:
-        while True:
-            header_line = f.readline().strip()
-            if not header_line:
-                break
+def cluster_sequences_same_length(sequences: list[UniqueSequence], n_edits: int) -> list[Cluster]:
+    # Create initial single-member clusters (start with most abundant sequences)
+    sequences = sorted(seqs, key=lambda x: x.count, reverse=True)
+    clusters = [Cluster(representative=seq, members=[]) for seq in sequences]
 
-            # Remove the '@' from the header
-            header = header_line[1:] if header_line.startswith('@') else header_line
-            seq = f.readline().strip()
-            f.readline()  # Skip '+' line
-            f.readline()  # Skip quality line
+    # Create n_edits + 1 partitions, so that at least one partition is guaranteed to match
+    sequence_length = len(clusters[0].representative.sequence)
+    partitions = generate_partitions(sequence_length, n_edits + 1)
 
-            # Skip sequences with invalid characters
-            if not is_valid_sequence(seq):
-                skipped_sequences += 1
+    for start, end in partitions:
+        hash_to_candidates = defaultdict(list)
+        for cluster in clusters:
+            sequence_partition = cluster.representative.sequence[start:end]
+            hash_to_candidates[sequence_partition].append(cluster)
+
+        candidate_lists = list(hash_to_candidates.values())
+        for candidates in candidate_lists:
+            if len(candidates) < 2:
                 continue
 
-            processed_sequences += 1
+            for i, candidate_i in enumerate(candidates):
+                if candidate_i.representative is None:
+                    continue
+                seq_i = candidate_i.representative.sequence
 
-            # Progress reporting
-            if processed_sequences % 1000000 == 0:
-                print(f"Processed {processed_sequences:,} sequences, {len(clusters)} clusters")
+                for j in range(i + 1, len(candidates)):
+                    candidate_j = candidates[j]
+                    if candidate_j.representative is None:
+                        continue
+                    seq_j = candidate_j.representative.sequence
 
-            # Check if this exact sequence is already assigned to a cluster
-            if seq in seq_to_cluster:
-                cluster_id = seq_to_cluster[seq]
-                # Increment count for this sequence in the cluster
-                if seq in clusters[cluster_id]['sequences']:
-                    clusters[cluster_id]['sequences'][seq]['count'] += 1
-                else:
-                    clusters[cluster_id]['sequences'][seq] = {'count': 1, 'header': header}
-                clusters[cluster_id]['total_count'] += 1
-            else:
-                # Check if any neighbor of this sequence is in a cluster
-                found_cluster = find_matching_cluster(seq)
+                    difference = sum(ci != cj for ci, cj in zip(seq_i, seq_j))
+                    if difference <= n_edits:
+                        candidate_i.absorb(candidate_j)
 
-                if found_cluster is not None:
-                    # Add to existing cluster
-                    cluster_id = found_cluster
-                    clusters[cluster_id]['sequences'][seq] = {'count': 1, 'header': header}
-                    clusters[cluster_id]['total_count'] += 1
-
-                    # Only map the actual sequence we've seen
-                    seq_to_cluster[seq] = cluster_id
-                    cluster_sequences[cluster_id].add(seq)
-                else:
-                    # Create new cluster
-                    cluster_id = next_cluster_id
-                    next_cluster_id += 1
-
-                    clusters.append({
-                        'sequences': {seq: {'count': 1, 'header': header}},
-                        'total_count': 1
-                    })
-
-                    # Only map the actual sequence we've seen
-                    seq_to_cluster[seq] = cluster_id
-                    cluster_sequences.append({seq})
-
-    print(f"Processed {processed_sequences:,} valid sequences")
-    print(f"Skipped {skipped_sequences:,} sequences with invalid characters")
+        # Remove empty clusters
+        clusters = [cluster for cluster in clusters if cluster.representative is not None]
 
     return clusters
 
@@ -254,26 +249,22 @@ if __name__ == "__main__":
     else:
         print("Using nearest neighbors only (up to 1 mismatch)")
 
-    start = time.time()
+    start_time = time.time()
     sequences, total, skipped = read_sequences(args.input)
     read_time = time.time()
     total_unique = sum(len(v) for v in sequences.values())
     print(
         f"Read {total_unique:,} unique sequences ({total:,} total, {skipped:,} skipped) "
-        f"in {read_time - start:.3g} seconds"
+        f"in {read_time - start_time:.3g} seconds"
     )
 
     for seqlen in sorted(sequences.keys()):
         seqs = sequences[seqlen]
-        sequences[seqlen] = sorted(seqs, key=lambda x: x.count, reverse=True)
         total_counts = sum(s.count for s in sequences[seqlen])
         print(f"Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
-    dedup_time = time.time()
-    print(f"Sorted unique sequences by frequency in {dedup_time - read_time:.3g} seconds")
-
-    # clusters = cluster_sequences(args.input, args.include_next_nearest)
-    # cluster_time = time.time()
-    # print(f"Clustering took: {cluster_time - read_time:.3g} seconds")
+        clusters = cluster_sequences_same_length(seqs, 2 if args.include_next_nearest else 1)
+    cluster_time = time.time()
+    print(f"Clustered in {cluster_time - read_time:.3g} seconds")
 
     # print(f"Found {len(clusters):,} clusters")
     # print(f"Writing clustered sequences to: {args.output}")
@@ -283,4 +274,4 @@ if __name__ == "__main__":
 
     print("Done!")
 
-    print(f"Total time taken: {time.time() - start:.3g} seconds")
+    print(f"Total time taken: {time.time() - start_time:.3g} seconds")
