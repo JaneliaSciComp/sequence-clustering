@@ -1,10 +1,17 @@
 import time
 import argparse
+from dataclasses import dataclass
 
 import numpy as np
 
 
 INVALID_NUCLEOTIDE = 255  # Using uint8, so 255 is a convenient invalid value
+
+@dataclass
+class UniqueSequence:
+    sequence: str
+    count: int
+    header: str
 
 def generate_neighbors(seq, include_next_nearest=False):
     """
@@ -50,15 +57,17 @@ def is_valid_sequence(seq: str) -> bool:
     return all(c in 'ATCG' for c in seq)
 
 
-def read_sequences(fastq_file: str) -> tuple[list[str], np.ndarray, int]:
+def read_sequences(fastq_file: str) -> tuple[dict[int, list[UniqueSequence]], int]:
     """
     Generator to read sequences from a FASTQ file.
 
     :param fastq_file: Path to the FASTQ file.
-    :returns: A tuple containing the header and sequence.
+    :returns: A tuple containing the unique sequences separated by length, the
+        total count of processed sequences, and the count of skipped invalid
+        sequences.
     """
-    headers = []
-    sequences = []
+    sequences = {}
+    total = 0
     skipped = 0
 
     with open(fastq_file, 'r', encoding='ascii') as f:
@@ -66,7 +75,6 @@ def read_sequences(fastq_file: str) -> tuple[list[str], np.ndarray, int]:
             header_line = f.readline().strip()
             if not header_line:
                 break
-            header_line = header_line[1:] if header_line.startswith('@') else header_line
             seq = f.readline().strip()
 
             f.readline()  # Skip '+' line
@@ -75,24 +83,41 @@ def read_sequences(fastq_file: str) -> tuple[list[str], np.ndarray, int]:
             if not is_valid_sequence(seq):
                 skipped += 1
                 continue
+            total += 1
 
-            headers.append(header_line)
-            sequences.append(seq)
+            seqlen = len(seq)
+            if seqlen not in sequences:
+                sequences[seqlen] = {}
+            sequences_for_length = sequences[seqlen]
 
-    # Map nucleotides to integers: A=0, T=1, C=2, G=3
-    nuc_map = np.full(255, INVALID_NUCLEOTIDE, dtype='uint8')
-    for i, c in enumerate('ATCG'):
-        nuc_map[ord(c)] = i
+            if seq in sequences_for_length:
+                sequences_for_length[seq].count += 1
+            else:
+                sequences_for_length[seq] = UniqueSequence(
+                    sequence=seq,
+                    count=1,
+                    header=header_line[1:] if header_line.startswith('@') else header_line
+                )
 
-    # Convert to numpy array for efficient processing
-    max_len = max(len(s) for s in sequences)
-    seq_array = np.full((len(sequences), max_len), INVALID_NUCLEOTIDE, dtype='uint8')
+    sequences = {length: list(seq_dict.values()) for length, seq_dict in sequences.items()}
 
-    for idx, s in enumerate(sequences):
-        arr = np.frombuffer(s.encode('ascii', 'strict'), dtype='uint8')
-        seq_array[idx, :len(arr)] = nuc_map[arr]
+    return sequences, total, skipped
 
-    return headers, seq_array, skipped
+
+def sequences_to_numpy(sequences: list[UniqueSequence]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert list of UniqueSequence to a numpy array representation.
+
+    :param sequences: List of UniqueSequence objects.
+    :returns: A tuple containing a 2D numpy array of sequences and a 1D array of counts.
+    """
+    sequences = [
+        np.frombuffer(s.sequence.encode("ascii", "strict"), dtype="uint8")
+        for s in sequences
+    ]
+    counts = np.array([s.count for s in sequences], dtype='int64')
+
+    return np.array(sequences, dtype='uint8'), counts
 
 
 def cluster_sequences(fastq_file: str, include_next_nearest: bool = False) -> list[dict]:
@@ -230,21 +255,21 @@ if __name__ == "__main__":
         print("Using nearest neighbors only (up to 1 mismatch)")
 
     start = time.time()
-    headers, sequences, skipped = read_sequences(args.input)
+    sequences, total, skipped = read_sequences(args.input)
     read_time = time.time()
+    total_unique = sum(len(v) for v in sequences.values())
     print(
-        f"Read {len(sequences):,} sequences of length {sequences.shape[1]} "
-        f"(skipping {skipped:,}) in {read_time - start:.3g} seconds"
+        f"Read {total_unique:,} unique sequences ({total:,} total, {skipped:,} skipped) "
+        f"in {read_time - start:.3g} seconds"
     )
 
-    sequences, idx, counts = np.unique(sequences, axis=0, return_counts=True, return_index=True)
-    perm = np.argsort(counts)[::-1]
-    sequences = sequences[perm]
-    counts = counts[perm]
-    idx = idx[perm]
-    headers = [headers[i] for i in idx]
+    for seqlen in sorted(sequences.keys()):
+        seqs = sequences[seqlen]
+        sequences[seqlen] = sorted(seqs, key=lambda x: x.count, reverse=True)
+        total_counts = sum(s.count for s in sequences[seqlen])
+        print(f"Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
     dedup_time = time.time()
-    print(f"Found {len(sequences):,} unique sequences in {dedup_time - read_time:.3g} seconds")
+    print(f"Sorted unique sequences by frequency in {dedup_time - read_time:.3g} seconds")
 
     # clusters = cluster_sequences(args.input, args.include_next_nearest)
     # cluster_time = time.time()
