@@ -44,40 +44,6 @@ class Cluster:
         yield from self.members
 
 
-def generate_neighbors(seq, include_next_nearest=False):
-    """
-    Generate all possible sequences that are 1 nucleotide different from the given sequence.
-    Optionally include next-nearest neighbors (2 nucleotide differences).
-
-    Args:
-        seq (str): The input sequence.
-        include_next_nearest (bool): If True, also generate 2-mismatch neighbors.
-
-    Yields:
-        str: A sequence that is 1 or 2 nucleotides different from the input sequence.
-    """
-    nucleotides = 'ATCG'
-
-    # Generate 1-mismatch neighbors
-    for i in range(len(seq)):
-        for nucleotide in nucleotides:
-            if nucleotide != seq[i]:
-                yield seq[:i] + nucleotide + seq[i+1:]
-
-    # Generate 2-mismatch neighbors if requested
-    if include_next_nearest:
-        for i in range(len(seq)):
-            for j in range(i+1, len(seq)):
-                for nuc1 in nucleotides:
-                    if nuc1 != seq[i]:
-                        for nuc2 in nucleotides:
-                            if nuc2 != seq[j]:
-                                neighbor = list(seq)
-                                neighbor[i] = nuc1
-                                neighbor[j] = nuc2
-                                yield ''.join(neighbor)
-
-
 def is_valid_sequence(seq: str) -> bool:
     """
     Check if sequence contains only valid nucleotides (A, G, C, T).
@@ -153,22 +119,16 @@ def generate_partitions(n: int, k: int) -> list[tuple[int, int]]:
     return partitions
 
 
-def are_sequences_similar(seq1: str, seq2: str, n_edits: int) -> bool:
-    """
-    Check if two sequences are similar within a given number of edits (Hamming distance).
-
-    :param seq1: First sequence.
-    :param seq2: Second sequence.
-    :param n_edits: Maximum number of allowed edits.
-    :returns: True if sequences are similar within n_edits, False otherwise.
-    """
-    differences = sum(c1 != c2 for c1, c2 in zip(seq1, seq2))
-    return differences <= n_edits
-
-
 def cluster_sequences_same_length(sequences: list[UniqueSequence], n_edits: int) -> list[Cluster]:
+    """
+    Cluster sequences of the same length based on edit distance of their representatives.
+    
+    :param sequences: List of UniqueSequence objects of the same length.
+    :param n_edits: Number of allowed edits (typically 1 or 2).
+    :returns: List of clusters.
+    """
     # Create initial single-member clusters (start with most abundant sequences)
-    sequences = sorted(seqs, key=lambda x: x.count, reverse=True)
+    sequences = sorted(sequences, key=lambda x: x.count, reverse=True)
     clusters = [Cluster(representative=seq, members=[]) for seq in sequences]
 
     # Create n_edits + 1 partitions, so that at least one partition is guaranteed to match
@@ -218,7 +178,7 @@ def write_clustered_fasta(clusters, output_file):
     # Sort clusters by total count (descending)
     sorted_clusters = sorted(clusters, key=lambda x: x['total_count'], reverse=True)
 
-    with open(output_file, 'w') as f:
+    with open(output_file, 'w', encoding='ascii') as f:
         for cluster in sorted_clusters:
             # Find the most abundant sequence in this cluster as representative
             rep_seq = max(cluster['sequences'].items(), key=lambda x: x[1]['count'])
@@ -258,15 +218,17 @@ if __name__ == "__main__":
         f"in {read_time - start_time:.3g} seconds"
     )
 
+    clusters = {}
     for seqlen in sorted(sequences.keys()):
         seqs = sequences[seqlen]
         total_counts = sum(s.count for s in sequences[seqlen])
-        print(f"Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
-        clusters = cluster_sequences_same_length(seqs, 2 if args.include_next_nearest else 1)
+        print(f"  Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
+        N_EDITS = 2 if args.include_next_nearest else 1
+        clusters[seqlen] = cluster_sequences_same_length(seqs, N_EDITS)
     cluster_time = time.time()
-    print(f"Clustered in {cluster_time - read_time:.3g} seconds")
+    total_clusters = sum(len(c) for c in clusters.values())
+    print(f"Found {total_clusters:,} clusters in {cluster_time - read_time:.3g} seconds")
 
-    # print(f"Found {len(clusters):,} clusters")
     # print(f"Writing clustered sequences to: {args.output}")
     # write_clustered_fasta(clusters, args.output)
     # write_time = time.time()
