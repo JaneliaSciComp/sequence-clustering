@@ -7,7 +7,7 @@ from polyleven import levenshtein
 
 from .dsu import DisjointSetUnion
 from .io import FastQReader, FastAWriter
-from .utils import generate_partitions
+from .utils import generate_partitions, fill_buckets, compare_buckets
 
 
 @dataclass
@@ -81,26 +81,18 @@ def connect_sequences_same_length(
 
     for start, end in partitions:
         # Bucket sequences by hashing the current partition
-        seed_to_bucket = defaultdict(list)
-        for idx, seq in enumerate(sequences):
-            seed = seq.sequence[start:end]
-            seed_to_bucket[seed].append(idx)
+        seed_to_bucket = fill_buckets(sequences, start, end)
 
         # Compare sequences only within the same bucket
-        buckets = list(seed_to_bucket.values())
-        for bucket in buckets:
+        for bucket in seed_to_bucket.values():
             if len(bucket) < 2:
                 continue
 
-            while bucket:
-                i = bucket.pop()
-                seq_i = sequences[i].sequence
-
-                for j in bucket:
-                    seq_j = sequences[j].sequence
-
-                    if levenshtein(seq_i, seq_j, n_edits) <= n_edits:
-                        edges.append((i, j))
+            compare_buckets(
+                bucket, bucket,
+                sequences, sequences,
+                n_edits, edges
+            )
 
     return edges
 
@@ -132,32 +124,22 @@ def connect_sequences_different_length(
     for start, end in partitions:
         for shift in range(max_shift + 1):
             # Bucket sequences by hashing the current partition
-            hash_to_bucket = defaultdict(lambda: ([], []))
-            for idx, seq in enumerate(sequences_a):
-                sequence_partition = seq.sequence[start:end]
-                hash_to_bucket[sequence_partition][0].append(idx)
+            seed_to_bucket_a = fill_buckets(sequences_a, start, end)
 
             # Shift partition for sequences_b
-            start += shift
-            end += shift
-            for idx, seq in enumerate(sequences_b):
-                sequence_partition = seq.sequence[start:end]
-                hash_to_bucket[sequence_partition][1].append(idx)
+            seed_to_bucket_b = fill_buckets(sequences_b, start + shift, end + shift)
 
             # Compare sequences only within the same bucket
-            buckets = list(hash_to_bucket.values())
-            for bucket_a, bucket_b in buckets:
+            for seed, bucket_a in seed_to_bucket_a.items():
+                bucket_b = seed_to_bucket_b[seed]
                 if len(bucket_a) == 0 or len(bucket_b) == 0:
                     continue
 
-                for i in bucket_a:
-                    seq_i = sequences_a[i].sequence
-
-                    for j in bucket_b:
-                        seq_j = sequences_b[j].sequence
-
-                        if levenshtein(seq_i, seq_j, n_edits) <= n_edits:
-                            edges.append((i, j))
+                compare_buckets(
+                    bucket_a, bucket_b,
+                    sequences_a, sequences_b,
+                    n_edits, edges
+                )
 
     return edges
 
