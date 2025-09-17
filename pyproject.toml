@@ -9,6 +9,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "polyleven>=0.9.0",
     "pytest>=8.4.2",
 ]
 

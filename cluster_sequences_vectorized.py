@@ -3,10 +3,7 @@ import argparse
 from dataclasses import dataclass
 from collections import defaultdict
 
-from sequence_clustering import (
-    check_levenshtein_distance_same_length,
-    check_levenshtein_distance,
-)
+from polyleven import levenshtein
 
 
 @dataclass
@@ -172,7 +169,7 @@ def connect_sequences_same_length(
                 for j in bucket:
                     seq_j = sequences[j].sequence
 
-                    if check_levenshtein_distance_same_length(seq_i, seq_j, n_edits):
+                    if levenshtein(seq_i, seq_j, n_edits) <= n_edits:
                         edges.append((i, j))
 
     return edges
@@ -229,7 +226,7 @@ def connect_sequences_different_length(
                     for j in bucket_b:
                         seq_j = sequences_b[j].sequence
 
-                        if check_levenshtein_distance(seq_i, seq_j, n_edits):
+                        if levenshtein(seq_i, seq_j, n_edits) <= n_edits:
                             edges.append((i, j))
 
     return edges
