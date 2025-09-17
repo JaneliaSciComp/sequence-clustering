@@ -15,31 +15,47 @@ def check_levenshtein_distance(a: str, b: str, max_distance: int) -> bool:
         return True
 
     # Dynamic programming over a band of width 2 * max_distance + 1
-    inf = 10**9
+    inf = max_distance + 1  # Use smaller sentinel value
     band = 2 * max_distance + 1
 
-    # prev[d] = cost at diagonal d in [-max_distance..max_distance]
+    # Cost at diagonal d in [-max_distance..max_distance]
     prev = [inf] * band
+    curr = [inf] * band
     prev[max_distance] = 0
 
     for i in range(1, n + 1):
-        curr = [inf] * band
+        # Reset curr array
+        for k in range(band):
+            curr[k] = inf
+
         j_lo = max(1, i - max_distance)
         j_hi = min(m, i + max_distance)
+        min_curr = inf
 
-        # preload insertion (on 'a'): moving right in b within this row
-        # We'll fill curr from j_lo..j_hi
         for j in range(j_lo, j_hi + 1):
             d = (j - i) + max_distance  # diagonal index in [0..2 * max_distance]
-            sub = prev[d] + (a[i - 1] != b[j - 1]) if 0 <= d < band else inf
-            ins = curr[d - 1] + 1 if d - 1 >= 0 else inf           # insert into a (advance j)
-            dele = prev[d + 1] + 1 if d + 1 < band else inf        # delete from a (advance i)
-            curr[d] = sub if sub <= ins and sub <= dele else (ins if ins <= dele else dele)
 
-        if min(curr) > max_distance:   # whole band exceeded max_distance -> early reject
+            # Calculate costs directly without redundant conditionals
+            sub_cost = prev[d] + (a[i - 1] != b[j - 1])
+            ins_cost = curr[d - 1] + 1 if d > 0 else inf
+            del_cost = prev[d + 1] + 1 if d + 1 < band else inf
+
+            # Find minimum more efficiently
+            if sub_cost <= ins_cost:
+                curr[d] = sub_cost if sub_cost <= del_cost else del_cost
+            else:
+                curr[d] = ins_cost if ins_cost <= del_cost else del_cost
+
+            # Track minimum for early exit
+            if curr[d] < min_curr:
+                min_curr = curr[d]
+
+        # Early rejection if all values exceed max_distance
+        if min_curr > max_distance:
             return False
 
-        prev = curr
+        # Swap arrays instead of reassigning
+        prev, curr = curr, prev
 
     return prev[(m - n) + max_distance] <= max_distance
 
