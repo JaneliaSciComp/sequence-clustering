@@ -57,5 +57,9 @@ def check_levenshtein_distance_same_length(a: str, b: str, max_distance: int) ->
     if len(a) != len(b):
         raise ValueError("Strings must be of the same length")
 
-    differences = sum(1 for i in range(len(a)) if a[i] != b[i])
-    return differences <= max_distance
+    for c1, c2 in zip(a, b):
+        if c1 != c2:
+            max_distance -= 1
+            if max_distance < 0:
+                return False
+    return True
