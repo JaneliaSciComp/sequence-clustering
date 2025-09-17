@@ -1,6 +1,9 @@
 import pytest
 
-from sequence_clustering import check_levenshtein_distance, create_levenshtein_check
+from sequence_clustering import (
+    check_levenshtein_distance,
+    check_levenshtein_distance_same_length,
+)
 
 
 def test_identical_strings():
@@ -191,7 +194,7 @@ def test_same_length_optimization():
     ]
 
     for a, b, max_dist, expected in same_length_cases:
-        result = check_levenshtein_distance(a, b, max_dist, same_length_only=True)
+        result = check_levenshtein_distance_same_length(a, b, max_dist)
         assert result == expected, (
             f"Same-length check failed for '{a}', '{b}', max_dist={max_dist}"
         )
@@ -199,13 +202,15 @@ def test_same_length_optimization():
 
 def test_same_length_rejects_different_lengths():
     """Test that same-length checkers reject different-length strings."""
-    checker = create_levenshtein_check(2, same_length_only=True)
-
     # Different lengths should return False
-    assert checker("abc", "ab") is False
-    assert checker("ab", "abc") is False
-    assert checker("", "a") is False
-    assert checker("a", "") is False
+    with pytest.raises(ValueError):
+        check_levenshtein_distance_same_length("abc", "ab", 2)
+    with pytest.raises(ValueError):
+        check_levenshtein_distance_same_length("ab", "abc", 2)
+    with pytest.raises(ValueError):
+        check_levenshtein_distance_same_length("", "a", 2)
+    with pytest.raises(ValueError):
+        check_levenshtein_distance_same_length("a", "", 2)
 
 
 @pytest.mark.parametrize("max_distance", [0, 1, 2, 5])
@@ -233,7 +238,7 @@ def test_all_implementations_consistency(max_distance):
 
         # Same-length interface (only test if lengths match)
         if len(a) == len(b):
-            same_len_result = check_levenshtein_distance(a, b, max_distance, same_length_only=True)
+            same_len_result = check_levenshtein_distance_same_length(a, b, max_distance)
             assert func_result == same_len_result, (
                 f"Same-length inconsistency for '{a}', '{b}', max_dist={max_distance}"
             )

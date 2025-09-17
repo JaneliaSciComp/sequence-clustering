@@ -1,3 +1,3 @@
-from .levenshtein import create_levenshtein_check, check_levenshtein_distance
+from .levenshtein import check_levenshtein_distance, check_levenshtein_distance_same_length
 
-__all__ = ["create_levenshtein_check", "check_levenshtein_distance"]
+__all__ = ["check_levenshtein_distance", "check_levenshtein_distance_same_length"]
