@@ -122,24 +122,26 @@ def connect_sequences_different_length(
     max_shift = min(n_edits, len_b - len_a)
 
     for start, end in partitions:
+        # Bucket sequences by hashing the current partition
+        seed_to_bucket_a = fill_buckets(sequences_a, start, end)
+
+        # Shift partition for sequences_b
+        seed_to_bucket_b = {}
         for shift in range(max_shift + 1):
-            # Bucket sequences by hashing the current partition
-            seed_to_bucket_a = fill_buckets(sequences_a, start, end)
+            stb_for_shift = fill_buckets(sequences_b, start + shift, end + shift)
+            seed_to_bucket_b.update(stb_for_shift)
 
-            # Shift partition for sequences_b
-            seed_to_bucket_b = fill_buckets(sequences_b, start + shift, end + shift)
+        # Compare sequences only within the same bucket
+        for seed, bucket_a in seed_to_bucket_a.items():
+            bucket_b = seed_to_bucket_b.get(seed, [])
+            if len(bucket_a) == 0 or len(bucket_b) == 0:
+                continue
 
-            # Compare sequences only within the same bucket
-            for seed, bucket_a in seed_to_bucket_a.items():
-                bucket_b = seed_to_bucket_b[seed]
-                if len(bucket_a) == 0 or len(bucket_b) == 0:
-                    continue
-
-                compare_buckets(
-                    bucket_a, bucket_b,
-                    sequences_a, sequences_b,
-                    n_edits, edges
-                )
+            compare_buckets(
+                bucket_a, bucket_b,
+                sequences_a, sequences_b,
+                n_edits, edges
+            )
 
     return edges
 
