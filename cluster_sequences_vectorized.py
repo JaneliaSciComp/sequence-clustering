@@ -3,7 +3,10 @@ import argparse
 from dataclasses import dataclass
 from collections import defaultdict
 
-from sequence_clustering import check_levenshtein_distance_same_length
+from sequence_clustering import (
+    check_levenshtein_distance_same_length,
+    check_levenshtein_distance,
+)
 
 
 @dataclass
@@ -15,6 +18,47 @@ class UniqueSequence:
     sequence: str
     count: int
     header: str
+
+class DisjointSetUnion:
+    """
+    Disjoint Set Union (Union-Find) data structure with path compression and union by rank.
+    """
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        """Find the root of the set containing x with path compression."""
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int):
+        """Union the sets containing a and b. Returns True if merged, False if
+        already in the same set."""
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+        return True
+
+    def update(self, edges: list[tuple[int, int]], offset_a: int = 0, offset_b: int = 0):
+        """Union all pairs in edges."""
+        for u, v in edges:
+            self.union(u + offset_a, v + offset_b)
+
+    def get_components(self) -> list[list[int]]:
+        """Get all components as lists of nodes."""
+        components = defaultdict(list)
+        for i in range(len(self.parent)):
+            r = self.find(i)
+            components[r].append(i)
+        return list(components.values())
 
 
 def is_valid_sequence(seq: str) -> bool:
@@ -92,13 +136,15 @@ def generate_partitions(n: int, k: int) -> list[tuple[int, int]]:
     return partitions
 
 
-def connect_sequences_same_length(sequences: list[UniqueSequence], n_edits: int) -> list[tuple[int, int]]:
+def connect_sequences_same_length(
+    sequences: list[UniqueSequence], n_edits: int
+) -> list[tuple[int, int]]:
     """
-    Cluster sequences of the same length based on edit distance of their representatives.
+    Connect sequences of the same length based on edit distance of their representatives.
     
     :param sequences: List of UniqueSequence objects of the same length.
     :param n_edits: Number of allowed edits (typically 1 or 2).
-    :returns: List of clusters.
+    :returns: List of edges.
     """
     # Create n_edits + 1 partitions, so that at least one partition is guaranteed to match
     sequence_length = len(sequences[0].sequence)
@@ -128,6 +174,63 @@ def connect_sequences_same_length(sequences: list[UniqueSequence], n_edits: int)
 
                     if check_levenshtein_distance_same_length(seq_i, seq_j, n_edits):
                         edges.append((i, j))
+
+    return edges
+
+
+def connect_sequences_different_length(
+    sequences_a: list[UniqueSequence], sequences_b: list[UniqueSequence], n_edits: int
+) -> list[tuple[int, int]]:
+    """
+    Connect sequences of different length based on edit distance of their representatives.
+
+    :param sequences_a: List of UniqueSequence objects.
+    :param sequences_b: List of UniqueSequence objects of different length.
+    :param n_edits: Number of allowed edits (typically 1 or 2).
+    :returns: List of edges.
+    """
+    # Make sure sequences_a is the shorter list
+    len_a = len(sequences_a[0].sequence)
+    len_b = len(sequences_b[0].sequence)
+    if len_a > len_b:
+        edges = connect_sequences_different_length(sequences_b, sequences_a, n_edits)
+        return [(j, i) for i, j in edges]
+
+    # Create n_edits + 1 partitions, so that at least one partition is guaranteed to match
+    partitions = generate_partitions(len_a, n_edits + 1)
+
+    edges = []
+    max_shift = min(n_edits, len_b - len_a)
+
+    for start, end in partitions:
+        for shift in range(max_shift + 1):
+            # Bucket sequences by hashing the current partition
+            hash_to_bucket = defaultdict(lambda: ([], []))
+            for idx, seq in enumerate(sequences_a):
+                sequence_partition = seq.sequence[start:end]
+                hash_to_bucket[sequence_partition][0].append(idx)
+
+            # Shift partition for sequences_b
+            start += shift
+            end += shift
+            for idx, seq in enumerate(sequences_b):
+                sequence_partition = seq.sequence[start:end]
+                hash_to_bucket[sequence_partition][1].append(idx)
+
+            # Compare sequences only within the same bucket
+            buckets = list(hash_to_bucket.values())
+            for bucket_a, bucket_b in buckets:
+                if len(bucket_a) == 0 or len(bucket_b) == 0:
+                    continue
+
+                for i in bucket_a:
+                    seq_i = sequences_a[i].sequence
+
+                    for j in bucket_b:
+                        seq_j = sequences_b[j].sequence
+
+                        if check_levenshtein_distance(seq_i, seq_j, n_edits):
+                            edges.append((i, j))
 
     return edges
 
@@ -177,22 +280,50 @@ if __name__ == "__main__":
     start_time = time.time()
     sequences, total, skipped = read_sequences(args.input)
     read_time = time.time()
-    total_unique = sum(len(v) for v in sequences.values())
+    n_sequences = [len(v) for v in sequences.values()]
+    total_unique = sum(n_sequences)
     print(
         f"Read {total_unique:,} unique sequences ({total:,} total, {skipped:,} skipped) "
         f"in {read_time - start_time:.3g} seconds"
     )
 
-    edges = {}
-    for seqlen in sorted(sequences.keys()):
+    # Compute offsets of sequences into a global index space
+    offsets = [0]
+    for n in n_sequences:
+        offsets.append(offsets[-1] + n)
+
+    # Compute edges and cluster sequences based on those
+    dsu = DisjointSetUnion(total_unique)
+    lengths = sorted(sequences.keys())
+    n_lengths = len(lengths)
+    N_EDITS = 2 if args.include_next_nearest else 1
+    # Flatten the list of lists into a single list
+    all_sequences = [seq for l in lengths for seq in sequences[l]]
+
+    for i in range(n_lengths):
+        seqlen = lengths.pop(0)
         seqs = sequences[seqlen]
         total_counts = sum(s.count for s in sequences[seqlen])
         print(f"  Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
-        N_EDITS = 2 if args.include_next_nearest else 1
-        edges[seqlen] = connect_sequences_same_length(seqs, N_EDITS)
+        edges = connect_sequences_same_length(seqs, N_EDITS)
+        dsu.update(edges, offset_a=offsets[i], offset_b=offsets[i])
+
+        for j, other_len in enumerate(lengths):
+            if abs(other_len - seqlen) > N_EDITS:
+                continue
+            other_seqs = sequences[other_len]
+            edges = []
+            edges = connect_sequences_different_length(seqs, other_seqs, N_EDITS)
+            dsu.update(edges, offset_a=offsets[i], offset_b=offsets[j])
+
+    clusters = []
+    for components in dsu.get_components():
+        representative_idx = max(components, key=lambda i: all_sequences[i].count)
+        representative = all_sequences[representative_idx].sequence
+        clusters.append(representative)
+
     cluster_time = time.time()
-    total_edges = sum(len(e) for e in edges.values())
-    print(f"Found {total_edges:,} edges in {cluster_time - read_time:.3g} seconds")
+    print(f"Found {len(clusters):,} clusters in {cluster_time - read_time:.3g} seconds")
 
     # print(f"Writing clustered sequences to: {args.output}")
     # write_clustered_fasta(clusters, args.output)
