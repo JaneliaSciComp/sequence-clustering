@@ -3,6 +3,8 @@ import argparse
 from dataclasses import dataclass
 from collections import defaultdict
 
+from sequence_clustering import check_levenshtein_distance_same_length
+
 
 @dataclass
 class UniqueSequence:
@@ -13,35 +15,6 @@ class UniqueSequence:
     sequence: str
     count: int
     header: str
-
-
-@dataclass
-class Cluster:
-    """
-    A cluster of similar sequences.
-    """
-    representative: UniqueSequence
-    members: list[UniqueSequence]
-
-    @property
-    def total_count(self) -> int:
-        """Return the total count of sequences in the cluster."""
-        return sum(member.count for member in self.members) + self.representative.count
-
-    def absorb(self, other: 'Cluster'):
-        """Absorb another cluster into this one."""
-        self.members.append(other.representative)
-        self.members.extend(other.members)
-
-        other.members.clear()
-        other.representative = None  # type: ignore
-
-    def __len__(self) -> int:
-        return 1 + len(self.members)
-
-    def __iter__(self):
-        yield self.representative
-        yield from self.members
 
 
 def is_valid_sequence(seq: str) -> bool:
@@ -119,7 +92,7 @@ def generate_partitions(n: int, k: int) -> list[tuple[int, int]]:
     return partitions
 
 
-def cluster_sequences_same_length(sequences: list[UniqueSequence], n_edits: int) -> list[Cluster]:
+def connect_sequences_same_length(sequences: list[UniqueSequence], n_edits: int) -> list[tuple[int, int]]:
     """
     Cluster sequences of the same length based on edit distance of their representatives.
     
@@ -127,44 +100,36 @@ def cluster_sequences_same_length(sequences: list[UniqueSequence], n_edits: int)
     :param n_edits: Number of allowed edits (typically 1 or 2).
     :returns: List of clusters.
     """
-    # Create initial single-member clusters (start with most abundant sequences)
-    sequences = sorted(sequences, key=lambda x: x.count, reverse=True)
-    clusters = [Cluster(representative=seq, members=[]) for seq in sequences]
-
     # Create n_edits + 1 partitions, so that at least one partition is guaranteed to match
-    sequence_length = len(clusters[0].representative.sequence)
+    sequence_length = len(sequences[0].sequence)
     partitions = generate_partitions(sequence_length, n_edits + 1)
 
-    for start, end in partitions:
-        hash_to_candidates = defaultdict(list)
-        for cluster in clusters:
-            sequence_partition = cluster.representative.sequence[start:end]
-            hash_to_candidates[sequence_partition].append(cluster)
+    edges = []
 
-        candidate_lists = list(hash_to_candidates.values())
-        for candidates in candidate_lists:
-            if len(candidates) < 2:
+    for start, end in partitions:
+        # Bucket sequences by hashing the current partition
+        hash_to_bucket = defaultdict(list)
+        for idx, seq in enumerate(sequences):
+            sequence_partition = seq.sequence[start:end]
+            hash_to_bucket[sequence_partition].append(idx)
+
+        # Compare sequences only within the same bucket
+        buckets = list(hash_to_bucket.values())
+        for bucket in buckets:
+            if len(bucket) < 2:
                 continue
 
-            for i, candidate_i in enumerate(candidates):
-                if candidate_i.representative is None:
-                    continue
-                seq_i = candidate_i.representative.sequence
+            while bucket:
+                i = bucket.pop()
+                seq_i = sequences[i].sequence
 
-                for j in range(i + 1, len(candidates)):
-                    candidate_j = candidates[j]
-                    if candidate_j.representative is None:
-                        continue
-                    seq_j = candidate_j.representative.sequence
+                for j in bucket:
+                    seq_j = sequences[j].sequence
 
-                    difference = sum(ci != cj for ci, cj in zip(seq_i, seq_j))
-                    if difference <= n_edits:
-                        candidate_i.absorb(candidate_j)
+                    if check_levenshtein_distance_same_length(seq_i, seq_j, n_edits):
+                        edges.append((i, j))
 
-        # Remove empty clusters
-        clusters = [cluster for cluster in clusters if cluster.representative is not None]
-
-    return clusters
+    return edges
 
 
 def write_clustered_fasta(clusters, output_file):
@@ -218,16 +183,16 @@ if __name__ == "__main__":
         f"in {read_time - start_time:.3g} seconds"
     )
 
-    clusters = {}
+    edges = {}
     for seqlen in sorted(sequences.keys()):
         seqs = sequences[seqlen]
         total_counts = sum(s.count for s in sequences[seqlen])
         print(f"  Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
         N_EDITS = 2 if args.include_next_nearest else 1
-        clusters[seqlen] = cluster_sequences_same_length(seqs, N_EDITS)
+        edges[seqlen] = connect_sequences_same_length(seqs, N_EDITS)
     cluster_time = time.time()
-    total_clusters = sum(len(c) for c in clusters.values())
-    print(f"Found {total_clusters:,} clusters in {cluster_time - read_time:.3g} seconds")
+    total_edges = sum(len(e) for e in edges.values())
+    print(f"Found {total_edges:,} edges in {cluster_time - read_time:.3g} seconds")
 
     # print(f"Writing clustered sequences to: {args.output}")
     # write_clustered_fasta(clusters, args.output)
