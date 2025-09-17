@@ -1,9 +1,21 @@
 [project]
 name = "sequence-clustering"
 version = "0.1.0"
-description = ""
+description = "Small tool for clustering sequences"
 readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Michael Innerberger", email = "innerbergerm@hhmi.org"},
+]
 requires-python = ">=3.12"
 dependencies = [
     "pytest>=8.4.2",
 ]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
