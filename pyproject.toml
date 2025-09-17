@@ -1,10 +1,9 @@
 [project]
-name = "sequence-scripts"
+name = "sequence-clustering"
 version = "0.1.0"
 description = ""
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "faiss-cpu>=1.12.0",
-    "numpy>=2.3.3",
+    "pytest>=8.4.2",
 ]
