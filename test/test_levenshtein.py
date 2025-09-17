@@ -1,6 +1,6 @@
 import pytest
 
-from sequence_clustering import check_levenshtein_distance, LevenshteinCheck
+from sequence_clustering import check_levenshtein_distance, create_levenshtein_check
 
 
 def test_identical_strings():
@@ -155,34 +155,6 @@ def test_known_examples():
     assert check_levenshtein_distance("saturday", "sunday", max_distance=2) is False
 
 
-# Tests for the new class-based interface
-def test_levenshtein_check_factory():
-    """Test the LevenshteinCheck factory method creates correct implementations."""
-    # Test regular implementations
-    checker_0 = LevenshteinCheck.create(0)
-    checker_1 = LevenshteinCheck.create(1)
-    checker_2 = LevenshteinCheck.create(2)
-    checker_general = LevenshteinCheck.create(5)
-
-    assert checker_0.__class__.__name__ == "LevenshteinCheck0"
-    assert checker_1.__class__.__name__ == "LevenshteinCheck1"
-    assert checker_2.__class__.__name__ == "LevenshteinCheck2"
-    assert checker_general.__class__.__name__ == "LevenshteinCheckGeneral"
-
-    # Test same-length implementations
-    checker_same_0 = LevenshteinCheck.create(0, same_length_only=True)
-    checker_same_1 = LevenshteinCheck.create(1, same_length_only=True)
-    checker_same_2 = LevenshteinCheck.create(2, same_length_only=True)
-    checker_same_general = LevenshteinCheck.create(5, same_length_only=True)
-
-    assert checker_same_0.__class__.__name__ == "LevenshteinCheckSameLength0"
-    assert checker_same_1.__class__.__name__ == "LevenshteinCheckSameLength1"
-    assert checker_same_2.__class__.__name__ == "LevenshteinCheckSameLength2"
-    assert (
-        checker_same_general.__class__.__name__ == "LevenshteinCheckSameLengthGeneral"
-    )
-
-
 def test_class_interface_correctness():
     """Test that class interface produces same results as function interface."""
     test_cases = [
@@ -200,8 +172,7 @@ def test_class_interface_correctness():
         func_result = check_levenshtein_distance(a, b, max_dist)
 
         # Test class interface
-        checker = LevenshteinCheck.create(max_dist)
-        class_result = checker(a, b)
+        class_result = check_levenshtein_distance(a, b, max_dist)
 
         assert func_result == class_result, (
             f"Mismatch for '{a}', '{b}', max_dist={max_dist}"
@@ -220,8 +191,7 @@ def test_same_length_optimization():
     ]
 
     for a, b, max_dist, expected in same_length_cases:
-        checker = LevenshteinCheck.create(max_dist, same_length_only=True)
-        result = checker(a, b)
+        result = check_levenshtein_distance(a, b, max_dist, same_length_only=True)
         assert result == expected, (
             f"Same-length check failed for '{a}', '{b}', max_dist={max_dist}"
         )
@@ -229,7 +199,7 @@ def test_same_length_optimization():
 
 def test_same_length_rejects_different_lengths():
     """Test that same-length checkers reject different-length strings."""
-    checker = LevenshteinCheck.create(2, same_length_only=True)
+    checker = create_levenshtein_check(2, same_length_only=True)
 
     # Different lengths should return False
     assert checker("abc", "ab") is False
@@ -255,8 +225,7 @@ def test_all_implementations_consistency(max_distance):
         func_result = check_levenshtein_distance(a, b, max_distance)
 
         # Regular class interface
-        checker = LevenshteinCheck.create(max_distance)
-        class_result = checker(a, b)
+        class_result = check_levenshtein_distance(a, b, max_distance)
 
         assert func_result == class_result, (
             f"Inconsistency for '{a}', '{b}', max_dist={max_distance}"
@@ -264,10 +233,7 @@ def test_all_implementations_consistency(max_distance):
 
         # Same-length interface (only test if lengths match)
         if len(a) == len(b):
-            same_len_checker = LevenshteinCheck.create(
-                max_distance, same_length_only=True
-            )
-            same_len_result = same_len_checker(a, b)
+            same_len_result = check_levenshtein_distance(a, b, max_distance, same_length_only=True)
             assert func_result == same_len_result, (
                 f"Same-length inconsistency for '{a}', '{b}', max_dist={max_distance}"
             )
