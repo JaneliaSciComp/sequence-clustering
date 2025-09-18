@@ -168,6 +168,7 @@ def main():
 
     start_time = time.time()
     sequences, total, skipped = read_sequences(args.input)
+    sequences = dict(sorted(sequences.items()))
     read_time = time.time()
     n_sequences = [len(v) for v in sequences.values()]
     total_unique = sum(n_sequences)
@@ -183,33 +184,33 @@ def main():
 
     # Compute edges and cluster sequences based on those
     dsu = DisjointSetUnion(total_unique)
-    lengths = sorted(sequences.keys())
-    n_lengths = len(lengths)
-    N_EDITS = 2 if args.include_next_nearest else 1
-    # Flatten the list of lists into a single list
-    all_sequences = [seq for l in lengths for seq in sequences[l]]
+    lengths = list(sequences.keys())
+    n_edits = 2 if args.include_next_nearest else 1
 
-    for i in range(n_lengths):
+    for i in range(len(sequences)):
         seqlen = lengths.pop(0)
         seqs = sequences[seqlen]
         total_counts = sum(s.count for s in sequences[seqlen])
         print(f"  Length {seqlen}: Found {len(seqs):,} unique sequences ({total_counts:,} total)")
-        edges = connect_sequences_same_length(seqs, N_EDITS)
+        edges = connect_sequences_same_length(seqs, n_edits)
+        print(f"    Found {len(edges):,} links among length {seqlen} sequences")
         dsu.update(edges, offset_a=offsets[i], offset_b=offsets[i])
 
-        for j, other_len in enumerate(lengths):
-            if abs(other_len - seqlen) > N_EDITS:
+        for j, other_len in enumerate(lengths, start=i + 1):
+            if abs(other_len - seqlen) > n_edits:
                 continue
             other_seqs = sequences[other_len]
-            edges = []
-            edges = connect_sequences_different_length(seqs, other_seqs, N_EDITS)
+            edges = connect_sequences_different_length(seqs, other_seqs, n_edits)
+            print(f"    Found {len(edges):,} links with length {other_len} sequences")
             dsu.update(edges, offset_a=offsets[i], offset_b=offsets[j])
 
+    # Flatten the list of lists into a single list and report cluster representatives
     clusters = []
+    sequences = [seq for seqs in sequences.values() for seq in seqs]
     for components in dsu.get_components():
-        representative_idx = max(components, key=lambda i: all_sequences[i].count)
-        representative = all_sequences[representative_idx]
-        representative.count = sum(all_sequences[i].count for i in components)
+        representative_idx = max(components, key=lambda i: sequences[i].count)
+        representative = sequences[representative_idx]
+        representative.count = sum(sequences[i].count for i in components)
         clusters.append(representative)
 
     cluster_time = time.time()

@@ -17,6 +17,10 @@ cdef class DisjointSetUnion:
 
     cdef int _find(self, int x):
         """Internal find method with path compression."""
+        # Bounds check to prevent segfaults
+        if x < 0 or x >= self.n:
+            raise IndexError(f"Index {x} out of bounds for size {self.n}")
+
         cdef int original_x = x
         cdef int root
         
@@ -36,6 +40,10 @@ cdef class DisjointSetUnion:
 
     cdef bint _union(self, int a, int b):
         """Internal union method. Returns True if merged, False if already in the same set."""
+        # Bounds check to prevent segfaults
+        if a < 0 or a >= self.n or b < 0 or b >= self.n:
+            raise IndexError(f"Index out of bounds: a={a}, b={b} for size {self.n}")
+
         cdef int ra = self._find(a)
         cdef int rb = self._find(b)
         

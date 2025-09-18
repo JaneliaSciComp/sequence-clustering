@@ -22,7 +22,7 @@ setup(
         extensions,
         compiler_directives={
             'language_level': 3,
-            'boundscheck': False,
+            'boundscheck': True,  # Enable bounds checking for safety
             'wraparound': False,
             'cdivision': True,
             'nonecheck': False,

@@ -3,10 +3,6 @@ from dataclasses import dataclass
 
 from polyleven import levenshtein
 
-# Import C-level string operations for performance
-from libc.string cimport strlen
-from libc.stdlib cimport malloc, free
-
 @dataclass
 class UniqueSequence:
     """
