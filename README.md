@@ -1,15 +1,23 @@
 # Sequence Clustering Scripts
 
-To run, use
-```
-python cluster_sequences.py -i merged_lenfilt.fq -o merged_lenfilt_cluster.fasta [--include_next_nearest]
-```
+A small set of scripts for clustering sequences using the following algorithm:
+- Find all unique sequences in the dataset, recording their absolute frequency.
+- Find all pairs of unique sequences that are within max_edits (1 or 2) from each other; for this
+  - Use a bucketing algorithm that's guaranteed to not have false negatives (multi-index hashing with max_edits + 1 seeds, shifting the seeds for sequences of different lengths)
+  - Compute the Levenshtein distance all pairs of sequences within a bucket (the buckets are pretty small on average)
+  - Record all pairs where the distance is <= max_edits
+- Find the topological components of the graph represented by these pairs -> these are the clusters (two sequences in such a cluster can have a distance more than max_edits, but they are always linked by a chain of at most max_edits edits; sequences of two distinct clusters are separated by more than max_edits edits)
+- Use the sequence with the highest frequency as a representative of the cluster and write the representatives to a .fasta file
 
-## Questions
+## Setup
 
-- Is this a well-defined problem? If three sequences A, B, C are such that A and B differ in 1 position, and A and C differ in 1 position, but B and C differ in 2 positions, the number of clusters depends on the order in which the sequences are processed. If they are processed in the order A, B, C, they will be grouped into one cluster. If they are processed in the order B, C, A, they will be grouped into two clusters (B and C into separate clusters, A into the cluster of whichever sequence is generated first by the perturbation function).
-- The library seems to have sequences of different lengths. Do we only cluster based on substitutions, or do we also consider deletes / insertions?
-- What will the ultimate input look like? One file with all the sequences, or will the sequences be split into multiple files? What is the expected number of sequences per file?
+The project is implemented in Python and Cython and uses `uv` for dependency management and execution.
+
+1. Download [`uv`](https://github.com/astral-sh/uv) and install it.
+
+2. Install the package: `uv sync` (optional, since running the scripts via `uv run <script>` will automatically install dependencies).
+
+3. Run the code: `uv run cluster_sequences -i <input.fq> -o <output.fasta> [--include_next_nearest]`
 
 
 ## Experiments
