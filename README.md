@@ -22,3 +22,12 @@ Ran some preliminary scaling tests that suggest that the FAISS-based approach do
 |---------------|----------------------------|-----------------------------|----------------------------------|
 | 10^4          | 4.07                       | 1.52                        | 0.057                            |
 | 10^6          | 155                        | 53                          | 47                               |
+
+### 2025-09-17
+
+Implemented a new approach that uses bucketing based on substrings to reduce the number of pairwise comparisons and implemented some parts in Cython for speedup.
+
+| Num sequences | `__main__.py` [s] |
+|---------------|-------------------|
+| 10^4          | 0.020              |
+| 10^6          | 4.13               |
