@@ -1,6 +1,7 @@
 # Project-specific files
 *.fq
 *.fasta
+*.csv
 *.c
 
 # Byte-compiled / optimized / DLL files

@@ -6,12 +6,12 @@ from polyleven import levenshtein
 @dataclass
 class UniqueSequence:
     """
-    A unique sequence with the number of duplicate reads and header info of
-    one of the reads.
+    A unique sequence with metadata tracked during clustering.
     """
     sequence: str
     count: int
-    header: str
+    length: int
+    index: int
 
 
 def is_valid_sequence(str seq):

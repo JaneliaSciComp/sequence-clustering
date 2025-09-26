@@ -1,9 +1,15 @@
+import csv
+import re
+from typing import Sequence
+from pathlib import Path
+
 from .utils import is_valid_sequence
+from .types import UniqueSequence
 
 
 class FastQReader:
     """
-    A simple FASTQ file reader that yields (header, sequence) tuples.
+    A simple FASTQ file reader that yields sequences.
     """
     def __init__(self, fastq_file: str):
         self.fastq_file = fastq_file
@@ -25,9 +31,38 @@ class FastQReader:
                     continue
                 self.total += 1
 
-                yield header_line, sequence
-                header = header_line[1:] if header_line.startswith('@') else header_line
-                yield header, sequence
+                yield sequence
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+
+class FastAReader:
+    """
+    A simple FASTA file reader that yields sequences.
+    """
+    def __init__(self, fastq_file: str):
+        self.fastq_file = fastq_file
+        self.total = 0
+        self.skipped = 0
+
+    def __iter__(self):
+        with open(self.fastq_file, 'r', encoding='ascii') as f:
+            while True:
+                header_line = f.readline().strip()
+                if not header_line:
+                    break
+                sequence = f.readline().strip()
+
+                if not is_valid_sequence(sequence):
+                    self.skipped += 1
+                    continue
+                self.total += 1
+
+                yield sequence
 
     def __enter__(self):
         return self
@@ -43,15 +78,107 @@ class FastAWriter:
     def __init__(self, fasta_file: str):
         self.fasta_file = fasta_file
         self.handle = open(fasta_file, 'w', encoding='ascii')
+        self._idx = 0
 
-    def write(self, header: str, sequence: str, total_count: int):
+    def write(self, sequence: str, total_count: int):
         """
         Write a sequence to the FASTA file with a header including the total count.
         """
-        self.handle.write(f">{header} N:{total_count}\n{sequence}\n")
+        self._idx += 1
+        self.handle.write(f">{self._idx} N:{total_count} len:{len(sequence)}\n{sequence}\n")
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.handle.close()
+
+
+def write_sequences_table(
+    sequences: Sequence[UniqueSequence], output_path: Path
+) -> None:
+    """Persist unique sequences to a tab-delimited file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="ascii") as handle:
+        # Write a comment line with summary statistics
+        unique_sequences = len(sequences)
+        total_reads = sum(record.count for record in sequences)
+        handle.write(f"# {unique_sequences=}, {total_reads=}\n")
+
+        # Write the header
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["sequence", "count"])
+
+        # Write data rows
+        for record in sequences:
+            writer.writerow([record.sequence, str(record.count)])
+
+
+def read_sequences_table(path: Path) -> list[UniqueSequence]:
+    """Load unique sequences from a CSV file."""
+    sequences: list[UniqueSequence] = []
+    with path.open("r", encoding="ascii") as handle:
+        # Skip comment lines
+        while True:
+            pos = handle.tell()
+            line = handle.readline()
+            if not line.startswith("#"):
+                handle.seek(pos)
+                break
+
+        # Read the header
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"Missing header in {path}")
+        expected = {"sequence", "count"}
+        if set(reader.fieldnames) != expected:
+            raise ValueError(
+                f"Unexpected columns in {path}: {reader.fieldnames}"
+            )
+
+        # Read data rows
+        for row in reader:
+            sequence = row["sequence"].strip()
+            count = int(row["count"])
+            sequences.append(
+                UniqueSequence(sequence=sequence, count=count)
+            )
+
+    return sequences
+
+
+def extract_counts(path: Path) -> tuple[int, int]:
+    """Extract unique sequence and total read counts from a CSV file."""
+    with path.open("r", encoding="ascii") as handle:
+        line = handle.readline()
+        match = re.match(r"# unique_sequences=(\d+), total_reads=(\d+)", line)
+        if not match:
+            raise ValueError(f"Invalid count line in {path}: {line.strip()}")
+        unique_sequences = int(match.group(1))
+        total_reads = int(match.group(2))
+        return unique_sequences, total_reads
+
+
+def write_edge_file(
+    output_file: Path,
+    edges: Sequence[tuple[int, int]],
+) -> Path:
+    """Write an edge list to a CSV file."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", newline="", encoding="ascii") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["index_a", "index_b"])
+        for index_a, index_b in edges:
+            writer.writerow([str(index_a), str(index_b)])
+
+
+def read_edge_file(path: Path) -> list[tuple[int, int]]:
+    """Read an edge list from a CSV file."""
+    edges: list[tuple[int, int]] = []
+    with path.open("r", encoding="ascii") as handle:
+        handle.readline()  # Skip header
+        reader = csv.reader(handle, delimiter="\t")
+
+        for row in reader:
+            edges.append((int(row[0]), int(row[1])))
+    return edges
