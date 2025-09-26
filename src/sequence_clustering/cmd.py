@@ -1,3 +1,6 @@
+import concurrent.futures
+import subprocess
+import sys
 import csv
 import re
 import time
@@ -61,30 +64,6 @@ def split_by_length(
         length_path = output_dir / f"length_{length}.csv"
         print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
         write_sequences_table(records, length_path)
-
-
-def load_sequences_for_length(
-    length_file: Path, sequence_map: dict[str, UniqueSequence]
-) -> list[UniqueSequence]:
-    """Return the UniqueSequence records referenced in a per-length file."""
-    records: list[UniqueSequence] = []
-    with length_file.open("r", encoding="ascii") as handle:
-        reader = csv.reader(handle, delimiter="\t")
-        for row in reader:
-            if not row:
-                continue
-            if row[0].startswith("#"):
-                continue
-            if row[0] == "sequence":
-                continue
-            sequence = row[0]
-            try:
-                records.append(sequence_map[sequence])
-            except KeyError as exc:
-                raise KeyError(
-                    f"Sequence {sequence!r} from {length_file} missing in unique table"
-                ) from exc
-    return records
 
 
 def connect_sequences_same_length(
@@ -180,6 +159,20 @@ def run_split(args) -> None:
     print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 
+
+
+def discover_length_files(length_dir: Path) -> dict[int, Path]:
+    """Return mapping of sequence length to per-length CSV path."""
+    pattern = re.compile(r"length_(\d+)\.csv")
+    result: dict[int, Path] = {}
+    for candidate in sorted(length_dir.glob("length_*.csv")):
+        match = pattern.fullmatch(candidate.name)
+        if not match:
+            raise ValueError(f"Unexpected per-length filename: {candidate}")
+        length = int(match.group(1))
+        result[length] = candidate
+    return result
+
 def run_pairs(args) -> None:
     """Find and write sequence pairs within a certain edit distance."""
     start = time.time()
@@ -225,24 +218,84 @@ def run_pairs(args) -> None:
     output_path = Path(args.output_dir) / f"pairs_len{length_a}_len{length_b}_d{distance}.csv"
     write_edge_file(output_path, edges)
     print(
-        f"Found {len(edges):,} pairs within distance {distance} "
-        f"for lengths ({length_a}, {length_b})."
+        f"({length_a}, {length_b}): Found {len(edges):,} pairs within distance {distance} "
     )
-    print(f"Wrote edge list to {output_path}")
-    print(f"Time elapsed: {time.time() - start:.2g} seconds")
+    print(f"({length_a}, {length_b}): Wrote edge list to {output_path}")
+    print(f"({length_a}, {length_b}): Time elapsed: {time.time() - start:.2g} seconds")
 
+
+def generate_length_pairs(lengths: list[int], max_distance: int) -> list[tuple[int, int]]:
+    """Return all length pairs (a <= b) within the given distance."""
+    pairs: list[tuple[int, int]] = []
+    for i, a in enumerate(lengths):
+        for b in lengths[i:]:
+            if abs(a - b) <= max_distance:
+                pairs.append((a, b))
+    return pairs
+
+
+def run_all_pairs(args) -> None:
+    """Run pairs for all length combinations within an edit distance."""
+    start = time.time()
+    length_dir = Path(args.length_dir)
+    output_dir = Path(args.output_dir)
+    max_workers = max(args.workers, 1)
+
+    length_files = discover_length_files(length_dir)
+    lengths = sorted(length_files)
+    pairs = generate_length_pairs(lengths, args.distance)
+    if not pairs:
+        print("No eligible length pairs found.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def launch_pair(length_a: int, length_b: int) -> None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "sequence_clustering",
+            "pairs",
+            "--length-dir",
+            str(length_dir),
+            "--length-a",
+            str(length_a),
+            "--length-b",
+            str(length_b),
+            "--distance",
+            str(args.distance),
+            "--output-dir",
+            str(output_dir),
+        ]
+        subprocess.run(cmd, check=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_pair = {
+            executor.submit(launch_pair, a, b): (a, b) for a, b in pairs
+        }
+        for future in concurrent.futures.as_completed(future_to_pair):
+            a, b = future_to_pair[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"pairs command failed for lengths ({a}, {b})"
+                ) from exc
+    
+    print(f"Processed {len(pairs):,} length pairs with {max_workers} workers.")
+    print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 def run_cluster(args) -> None:
     """Assemble clusters from edge lists and write representatives."""
     start = time.time()
     unique_path = Path(args.unique)
+    edges_path = Path(args.edges_dir)
     output_path = Path(args.output)
     sequences = read_sequences_table(unique_path)
-    total_reads = sum(record.count for record in sequences)
     dsu = DisjointSetUnion(len(sequences))
 
     edges: list[tuple[int, int]] = []
-    for edge_file in args.edges:
+    for edge_file in edges_path.glob("*.csv"):
         edge_path = Path(edge_file)
         file_edges = read_edge_file(edge_path)
         for u, v in file_edges:
@@ -250,29 +303,21 @@ def run_cluster(args) -> None:
         edges.extend(file_edges)
 
     components = dsu.get_components()
-    clusters: list[tuple[UniqueSequence, int, int]] = []
+    clusters: list[tuple[str, int, int]] = []
     for component in components:
         total_count = sum(sequences[idx].count for idx in component)
         representative_idx = max(component, key=lambda idx: sequences[idx].count)
-        representative = sequences[representative_idx]
-        clusters.append((representative, representative_idx, total_count))
+        representative = sequences[representative_idx].sequence
+        clusters.append((representative, len(component), total_count))
 
     clusters.sort(key=lambda item: item[2], reverse=True)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="ascii") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["sequence", "count", "length", "frequency"])
-        for representative, _, total_count in clusters:
-            frequency = total_count / total_reads if total_reads else 0.0
-            writer.writerow(
-                [
-                    representative.sequence,
-                    str(total_count),
-                    str(representative.length),
-                    f"{frequency:.12g}",
-                ]
-            )
+        writer.writerow(["sequence", "cluster_size", "total_count"])
+        for representative, cluster_size, total_count in clusters:
+            writer.writerow([representative, str(cluster_size), str(total_count)])
 
     print(
         f"Processed {len(sequences):,} sequences with {len(edges):,} edges into "
