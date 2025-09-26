@@ -1,13 +1,20 @@
-from __future__ import annotations
-
 import csv
+import re
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from .dsu import DisjointSetUnion
 from .types import UniqueSequence
-from .io import read_sequences_table, write_sequences_table, FastQReader
+from .io import (
+    read_sequences_table,
+    write_sequences_table,
+    read_edge_file,
+    write_edge_file,
+    extract_counts,
+    FastQReader
+)
 from .utils import (
     compare_buckets,
     fill_buckets,
@@ -39,8 +46,6 @@ def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], in
 def split_by_length(
     sequences: Sequence[UniqueSequence],
     output_dir: Path,
-    min_length: int | None,
-    max_length: int | None,
 ) -> None:
     """Write per-length tables with summary headers."""
     # Group sequences by length
@@ -50,20 +55,9 @@ def split_by_length(
         grouped[len(record.sequence)].append(record)
     grouped = dict(sorted(grouped.items()))
 
-    # Filter lengths outside the specified range
-    min_length = min_length or min(grouped.keys(), default=0)
-    max_length = max_length or max(grouped.keys(), default=0)
-
     # Write per-length files
     for length, records in grouped.items():
         length_reads = sum(r.count for r in records)
-        if length < min_length or length > max_length:
-            print(
-                f"Skipping length {length} "
-                f"({len(records):,} sequences, {length_reads:,} reads)"
-            )
-            continue
-
         length_path = output_dir / f"length_{length}.csv"
         print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
         write_sequences_table(records, length_path)
@@ -94,7 +88,7 @@ def load_sequences_for_length(
 
 
 def connect_sequences_same_length(
-    sequences: Sequence[UniqueSequence], n_edits: int
+    sequences: Sequence[UniqueSequence], n_edits: int, offset: int
 ) -> list[tuple[int, int]]:
     """Find all pairs of sequences within an edit distance for same-length sequences."""
     if not sequences:
@@ -109,6 +103,10 @@ def connect_sequences_same_length(
             bucket_a = list(bucket)
             bucket_b = list(bucket)
             compare_buckets(bucket_a, bucket_b, sequences, sequences, n_edits, edges)
+
+    # Adjust indices by offset
+    edges = [(i + offset, j + offset) for i, j in edges]
+
     return edges
 
 
@@ -116,15 +114,17 @@ def connect_sequences_different_length(
     sequences_a: Sequence[UniqueSequence],
     sequences_b: Sequence[UniqueSequence],
     n_edits: int,
+    offset_a: int,
+    offset_b: int,
 ) -> list[tuple[int, int]]:
     """Find all pairs of sequences within an edit distance for different-length sequences."""
     if not sequences_a or not sequences_b:
         return []
     len_a = len(sequences_a[0].sequence)
     len_b = len(sequences_b[0].sequence)
-    if len_a > len_b:
-        edges = connect_sequences_different_length(sequences_b, sequences_a, n_edits)
-        return [(j, i) for i, j in edges]
+
+    if abs(len_a - len_b) > n_edits:
+        return []
 
     partitions = generate_partitions(len_a, n_edits + 1)
     edges: list[tuple[int, int]] = []
@@ -146,72 +146,15 @@ def connect_sequences_different_length(
                 list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges
             )
 
-    return edges
+    # Adjust indices by offsets
+    edges = [(i + offset_a, j + offset_b) for i, j in edges]
 
-
-def deduplicate_edges(
-    edges: Iterable[tuple[int, int]],
-    sequences_a: Sequence[UniqueSequence],
-    sequences_b: Sequence[UniqueSequence],
-    same_length: bool,
-) -> list[tuple[int, int]]:
-    seen: set[tuple[int, int]] = set()
-    result: list[tuple[int, int]] = []
-    for i, j in edges:
-        idx_a = sequences_a[i].index
-        idx_b = sequences_b[j].index
-        if same_length:
-            if idx_a == idx_b:
-                continue
-            pair = (idx_a, idx_b) if idx_a < idx_b else (idx_b, idx_a)
-        else:
-            pair = (idx_a, idx_b)
-        if pair in seen:
-            continue
-        seen.add(pair)
-        result.append(pair)
-    result.sort()
-    return result
-
-
-def write_edge_file(
-    output_dir: Path,
-    length_a: int,
-    length_b: int,
-    distance: int,
-    edges: Sequence[tuple[int, int]],
-) -> Path:
-    """Write an edge list to a CSV file."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    name = f"pairs_len{min(length_a, length_b)}_len{max(length_a, length_b)}_d{distance}.csv"
-    path = output_dir / name
-    with path.open("w", newline="", encoding="ascii") as handle:
-        handle.write(
-            f"# length_a={length_a}\tlength_b={length_b}\tdistance={distance}\n"
-        )
-        writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["index_a", "index_b"])
-        for index_a, index_b in edges:
-            writer.writerow([str(index_a), str(index_b)])
-    return path
-
-
-def read_edge_file(path: Path) -> list[tuple[int, int]]:
-    """Read an edge list from a CSV file."""
-    edges: list[tuple[int, int]] = []
-    with path.open("r", encoding="ascii") as handle:
-        reader = csv.reader(handle, delimiter="\t")
-        for row in reader:
-            if not row or row[0].startswith("#"):
-                continue
-            if row[0] == "index_a":
-                continue
-            edges.append((int(row[0]), int(row[1])))
     return edges
 
 
 def run_unique(args) -> None:
     """Extract unique sequences from a FASTQ file."""
+    start = time.time()
     fastq_path = Path(args.fastq)
     output_path = Path(args.output)
     sequences, total_reads, skipped = collect_unique_sequences(fastq_path)
@@ -221,35 +164,44 @@ def run_unique(args) -> None:
         f"({total_reads:,} total reads, {skipped:,} skipped)."
     )
     print(f"Wrote unique sequence table to {output_path}")
+    print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 
 def run_split(args) -> None:
     """Split unique sequences into per-length tables."""
+    start = time.time()
     input_path = Path(args.input)
     output_dir = Path(args.output_dir)
     sequences = read_sequences_table(input_path)
-    split_by_length(
-        sequences,
-        output_dir,
-        args.min_length,
-        args.max_length,
-    )
+    split_by_length(sequences, output_dir)
     print(
         f"Split {len(sequences):,} sequences into per-length tables under {output_dir}"
     )
+    print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 
 def run_pairs(args) -> None:
     """Find and write sequence pairs within a certain edit distance."""
-    unique_path = Path(args.unique)
+    start = time.time()
     length_dir = Path(args.length_dir)
-    length_a = args.length_a
-    length_b = args.length_b
+    length_a = min(args.length_a, args.length_b)
+    length_b = max(args.length_a, args.length_b)
     distance = args.distance
 
-    sequences = read_sequences_table(unique_path)
-    sequence_map = {record.sequence: record for record in sequences}
+    # Read headers of all files to compute offsets
+    length_to_n = {}
+    for file in length_dir.glob("length_*.csv"):
+        length = int(re.match(r"length_(\d+)\.csv", file.name).group(1))
+        n_sequences, _ = extract_counts(file)
+        length_to_n[length] = n_sequences
+    offset_a = sum(
+        n for length, n in length_to_n.items() if length < length_a
+    )
+    offset_b = sum(
+        n for length, n in length_to_n.items() if length < length_b
+    )
 
+    # Load all sequences with given lengths
     file_a = length_dir / f"length_{length_a}.csv"
     file_b = length_dir / f"length_{length_b}.csv"
 
@@ -258,29 +210,31 @@ def run_pairs(args) -> None:
     if not file_b.exists():
         raise FileNotFoundError(f"Missing per-length file: {file_b}")
 
-    seqs_a = load_sequences_for_length(file_a, sequence_map)
-    seqs_b = load_sequences_for_length(file_b, sequence_map)
+    seqs_a = read_sequences_table(file_a)
+    seqs_b = read_sequences_table(file_b)
 
     same_length = length_a == length_b
     if same_length:
-        raw_edges = connect_sequences_same_length(seqs_a, distance)
-        sequences_b = seqs_a
+        raw_edges = connect_sequences_same_length(seqs_a, distance, offset_a)
     else:
-        raw_edges = connect_sequences_different_length(seqs_a, seqs_b, distance)
-        sequences_b = seqs_b
-    edges = deduplicate_edges(raw_edges, seqs_a, sequences_b, same_length)
+        raw_edges = connect_sequences_different_length(
+            seqs_a, seqs_b, distance, offset_a, offset_b
+        )
+    edges = list(set(raw_edges))  # Remove duplicates
 
-    output_dir = Path(args.output_dir)
-    edge_path = write_edge_file(output_dir, length_a, length_b, distance, edges)
+    output_path = Path(args.output_dir) / f"pairs_len{length_a}_len{length_b}_d{distance}.csv"
+    write_edge_file(output_path, edges)
     print(
         f"Found {len(edges):,} pairs within distance {distance} "
         f"for lengths ({length_a}, {length_b})."
     )
-    print(f"Wrote edge list to {edge_path}")
+    print(f"Wrote edge list to {output_path}")
+    print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 
 def run_cluster(args) -> None:
     """Assemble clusters from edge lists and write representatives."""
+    start = time.time()
     unique_path = Path(args.unique)
     output_path = Path(args.output)
     sequences = read_sequences_table(unique_path)
@@ -325,3 +279,4 @@ def run_cluster(args) -> None:
         f"{len(clusters):,} clusters."
     )
     print(f"Wrote cluster representatives to {output_path}")
+    print(f"Time elapsed: {time.time() - start:.2g} seconds")

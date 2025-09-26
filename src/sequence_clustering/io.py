@@ -1,4 +1,5 @@
 import csv
+import re
 from typing import Sequence
 from pathlib import Path
 
@@ -144,3 +145,40 @@ def read_sequences_table(path: Path) -> list[UniqueSequence]:
             )
 
     return sequences
+
+
+def extract_counts(path: Path) -> tuple[int, int]:
+    """Extract unique sequence and total read counts from a CSV file."""
+    with path.open("r", encoding="ascii") as handle:
+        line = handle.readline()
+        match = re.match(r"# unique_sequences=(\d+), total_reads=(\d+)", line)
+        if not match:
+            raise ValueError(f"Invalid count line in {path}: {line.strip()}")
+        unique_sequences = int(match.group(1))
+        total_reads = int(match.group(2))
+        return unique_sequences, total_reads
+
+
+def write_edge_file(
+    output_file: Path,
+    edges: Sequence[tuple[int, int]],
+) -> Path:
+    """Write an edge list to a CSV file."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", newline="", encoding="ascii") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["index_a", "index_b"])
+        for index_a, index_b in edges:
+            writer.writerow([str(index_a), str(index_b)])
+
+
+def read_edge_file(path: Path) -> list[tuple[int, int]]:
+    """Read an edge list from a CSV file."""
+    edges: list[tuple[int, int]] = []
+    with path.open("r", encoding="ascii") as handle:
+        handle.readline()  # Skip header
+        reader = csv.reader(handle, delimiter="\t")
+
+        for row in reader:
+            edges.append((int(row[0]), int(row[1])))
+    return edges
