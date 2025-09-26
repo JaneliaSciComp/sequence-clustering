@@ -113,13 +113,17 @@ def write_sequences_table(
             writer.writerow([record.sequence, str(record.count)])
 
 
-def read_sequences_table(path: Path) -> tuple[list[UniqueSequence], int]:
-    """Load unique sequences written by step 1 and return records plus total reads."""
+def read_sequences_table(path: Path) -> list[UniqueSequence]:
+    """Load unique sequences from a CSV file."""
     sequences: list[UniqueSequence] = []
-    total_reads = 0
     with path.open("r", encoding="ascii") as handle:
         # Skip comment lines
-        handle.readline()
+        while True:
+            pos = handle.tell()
+            line = handle.readline()
+            if not line.startswith("#"):
+                handle.seek(pos)
+                break
 
         # Read the header
         reader = csv.DictReader(handle, delimiter="\t")
@@ -135,9 +139,8 @@ def read_sequences_table(path: Path) -> tuple[list[UniqueSequence], int]:
         for row in reader:
             sequence = row["sequence"].strip()
             count = int(row["count"])
-            total_reads += count
             sequences.append(
                 UniqueSequence(sequence=sequence, count=count)
             )
 
-    return sequences, total_reads
+    return sequences

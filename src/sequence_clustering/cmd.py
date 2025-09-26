@@ -12,7 +12,6 @@ from .utils import (
     compare_buckets,
     fill_buckets,
     generate_partitions,
-    is_valid_sequence,
 )
 
 
@@ -39,7 +38,6 @@ def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], in
 
 def split_by_length(
     sequences: Sequence[UniqueSequence],
-    total_reads: int,
     output_dir: Path,
     min_length: int | None,
     max_length: int | None,
@@ -50,33 +48,25 @@ def split_by_length(
     grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
     for record in sequences:
         grouped[len(record.sequence)].append(record)
+    grouped = dict(sorted(grouped.items()))
 
     # Filter lengths outside the specified range
     min_length = min_length or min(grouped.keys(), default=0)
     max_length = max_length or max(grouped.keys(), default=0)
-    for length in list(grouped.keys()):
-        if length < min_length or length > max_length:
-            del grouped[length]
 
+    # Write per-length files
     for length, records in grouped.items():
-        length_path = output_dir / f"length_{length}.csv"
         length_reads = sum(r.count for r in records)
-        with length_path.open("w", newline="", encoding="ascii") as handle:
-            handle.write(
-                f"# unique_sequences={len(records)}\treads={length_reads}\n"
+        if length < min_length or length > max_length:
+            print(
+                f"Skipping length {length} "
+                f"({len(records):,} sequences, {length_reads:,} reads)"
             )
-            writer = csv.writer(handle, delimiter="\t")
-            writer.writerow(["sequence", "count", "length", "frequency"])
-            for record in records:
-                frequency = record.count / total_reads if total_reads else 0.0
-                writer.writerow(
-                    [
-                        record.sequence,
-                        str(record.count),
-                        str(record.length),
-                        f"{frequency:.12g}",
-                    ]
-                )
+            continue
+
+        length_path = output_dir / f"length_{length}.csv"
+        print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
+        write_sequences_table(records, length_path)
 
 
 def load_sequences_for_length(
@@ -191,6 +181,7 @@ def write_edge_file(
     distance: int,
     edges: Sequence[tuple[int, int]],
 ) -> Path:
+    """Write an edge list to a CSV file."""
     output_dir.mkdir(parents=True, exist_ok=True)
     name = f"pairs_len{min(length_a, length_b)}_len{max(length_a, length_b)}_d{distance}.csv"
     path = output_dir / name
@@ -206,6 +197,7 @@ def write_edge_file(
 
 
 def read_edge_file(path: Path) -> list[tuple[int, int]]:
+    """Read an edge list from a CSV file."""
     edges: list[tuple[int, int]] = []
     with path.open("r", encoding="ascii") as handle:
         reader = csv.reader(handle, delimiter="\t")
@@ -219,6 +211,7 @@ def read_edge_file(path: Path) -> list[tuple[int, int]]:
 
 
 def run_unique(args) -> None:
+    """Extract unique sequences from a FASTQ file."""
     fastq_path = Path(args.fastq)
     output_path = Path(args.output)
     sequences, total_reads, skipped = collect_unique_sequences(fastq_path)
@@ -231,12 +224,12 @@ def run_unique(args) -> None:
 
 
 def run_split(args) -> None:
+    """Split unique sequences into per-length tables."""
     input_path = Path(args.input)
     output_dir = Path(args.output_dir)
-    sequences, total_reads = read_sequences_table(input_path)
+    sequences = read_sequences_table(input_path)
     split_by_length(
         sequences,
-        total_reads,
         output_dir,
         args.min_length,
         args.max_length,
@@ -247,13 +240,14 @@ def run_split(args) -> None:
 
 
 def run_pairs(args) -> None:
+    """Find and write sequence pairs within a certain edit distance."""
     unique_path = Path(args.unique)
     length_dir = Path(args.length_dir)
     length_a = args.length_a
     length_b = args.length_b
     distance = args.distance
 
-    sequences, _ = read_sequences_table(unique_path)
+    sequences = read_sequences_table(unique_path)
     sequence_map = {record.sequence: record for record in sequences}
 
     file_a = length_dir / f"length_{length_a}.csv"
@@ -286,9 +280,11 @@ def run_pairs(args) -> None:
 
 
 def run_cluster(args) -> None:
+    """Assemble clusters from edge lists and write representatives."""
     unique_path = Path(args.unique)
     output_path = Path(args.output)
-    sequences, total_reads = read_sequences_table(unique_path)
+    sequences = read_sequences_table(unique_path)
+    total_reads = sum(record.count for record in sequences)
     dsu = DisjointSetUnion(len(sequences))
 
     edges: list[tuple[int, int]] = []

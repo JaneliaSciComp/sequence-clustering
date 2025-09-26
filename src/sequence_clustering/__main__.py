@@ -15,16 +15,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unique_parser.add_argument("--fastq", "-i", required=True, help="Input FASTQ file")
     unique_parser.add_argument(
-        "--output", "-o", required=True, help="Output TSV for unique sequences"
+        "--output", "-o", required=True, help="Output CSV for unique sequences"
     )
     unique_parser.set_defaults(func=run_unique)
 
     split_parser = subparsers.add_parser(
-        "split", help="Split unique table into per-length TSVs"
+        "split", help="Split unique table into per-length CSVs"
     )
-    split_parser.add_argument("--input", "-i", required=True, help="Unique TSV from step 1")
+    split_parser.add_argument("--input", "-i", required=True, help="Unique CSV from step 1")
     split_parser.add_argument(
-        "--output-dir", "-o", required=True, help="Directory for per-length TSV files"
+        "--output-dir", "-o", required=True, help="Directory for per-length CSV files"
     )
     split_parser.add_argument(
         "--min-length", type=int, default=None, help="Discard sequences shorter than this"
@@ -37,11 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     pairs_parser = subparsers.add_parser(
         "pairs", help="Find sequence pairs within an edit distance"
     )
-    pairs_parser.add_argument("--unique", required=True, help="Unique TSV from step 1")
+    pairs_parser.add_argument("--unique", required=True, help="Unique CSV from step 1")
     pairs_parser.add_argument(
         "--length-dir",
         required=True,
-        help="Directory containing per-length TSV files from step 2",
+        help="Directory containing per-length CSV files from step 2",
     )
     pairs_parser.add_argument("--length-a", type=int, required=True, help="First sequence length")
     pairs_parser.add_argument("--length-b", type=int, required=True, help="Second sequence length")
@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_parser = subparsers.add_parser(
         "cluster", help="Assemble clusters from edge lists"
     )
-    cluster_parser.add_argument("--unique", required=True, help="Unique TSV from step 1")
+    cluster_parser.add_argument("--unique", required=True, help="Unique CSV from step 1")
     cluster_parser.add_argument(
         "--edges",
         nargs="*",
@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Edge list files produced by the pairs subcommand",
     )
     cluster_parser.add_argument(
-        "--output", "-o", required=True, help="Output TSV for cluster representatives"
+        "--output", "-o", required=True, help="Output CSV for cluster representatives"
     )
     cluster_parser.set_defaults(func=run_cluster)
 
