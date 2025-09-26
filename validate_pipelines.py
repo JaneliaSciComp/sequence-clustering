@@ -94,7 +94,7 @@ def plot_histograms(
     ax1.grid(True, which="both", linestyle="--", linewidth=0.5)
 
     # Right plot: Cumulative distributions
-    ax2.plot(cdf_a, label="Old pipeline", color="tab:orange", linestyle="--")
+    ax2.plot(cdf_a, label="Original pipeline", color="tab:orange", linestyle="--")
     ax2.plot(cdf_b, label="New pipeline", color="tab:green", linestyle="-")
     ax2.set_xscale("log")
     ax2.set_xlabel("Top N sequences")

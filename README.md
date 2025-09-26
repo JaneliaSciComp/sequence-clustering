@@ -17,7 +17,35 @@ The project is implemented in Python and Cython and uses `uv` for dependency man
 
 2. Install the package: `uv sync` (optional, since running the scripts via `uv run <script>` will automatically install dependencies).
 
-3. Run the code: `uv run -m sequence_clustering -i <input.fq> -o <output.fasta> [--include_next_nearest]`
+3. Run the code: `uv run -m sequence_clustering -h`
+
+
+## Usage
+
+The full pipeline consists of multiple steps:
+1. Find unique sequences and their counts in the input FASTQ file:
+   ```
+   uv run -m sequence_clustering unique --input reads.fastq --output unique.csv
+   ```
+
+2. Split the unique sequences by length:
+   ```
+   uv run -m sequence_clustering split --input unique.csv --output-dir lengths
+   ```
+
+3. Find all pairs of sequences within max_edits of each other:
+   ```
+   uv run -m sequence_clustering all-pairs --length-dir lengths --length-a 25 --length-b 26 lengths --output-dir pairs --max-edits 2 --workers 4
+   ```
+   Optionally, the pairwise comparisons can be run separately:
+   ```
+   uv run -m sequence_clustering pairs --length-dir lengths --length-a 25 --length-b 26 --output pairs/pairs_25_26.csv --max-edits 2
+   ```
+
+4. Assemble clusters from the edge lists and write representatives:
+   ```
+   uv run -m sequence_clustering cluster --unique unique.csv --edges-dir pairs --output clusters.csv
+   ```
 
 
 ## Experiments
@@ -59,3 +87,9 @@ This is probably why it produces significantly more clusters than the new implem
 |---------------|------------------------|-------------------------|---------------------------------|
 | 10^4          | 2,253 (59)             | 2,350 (0)               | 2,124                           |
 | 10^6          | 52,534 (7,459)         | 73,166 (0)              | 46,492                          |
+
+### 2025-09-26
+
+The new implementation was tested on a subset of a ~1B read dataset (~5M unique sequences of length 25).
+It ran in about 45 minutes on a single core and produced about 150M edges.
+If this is the expected order of magnitude of reads, the current approach of parallelizing the pairwise distance computations by sequence length should work well to process the full dataset in a reasonable time (a few hours).
