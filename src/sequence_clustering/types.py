@@ -6,5 +6,3 @@ class UniqueSequence:
     """Represents a unique sequence observation."""
     sequence: str
     count: int
-    length: int
-    index: int

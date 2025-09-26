@@ -7,6 +7,7 @@ from typing import Iterable, Sequence
 
 from .dsu import DisjointSetUnion
 from .types import UniqueSequence
+from .io import read_sequences_table, write_sequences_table, FastQReader
 from .utils import (
     compare_buckets,
     fill_buckets,
@@ -17,86 +18,23 @@ from .utils import (
 
 def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], int, int]:
     """Return unique sequences, total reads, and skipped reads from a FASTQ file."""
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = defaultdict(int)
     total_reads = 0
     skipped_reads = 0
 
-    with fastq_path.open("r", encoding="ascii") as handle:
-        while True:
-            header = handle.readline()
-            if not header:
-                break
+    with FastQReader(fastq_path) as handle:
+        for sequence in handle:
+            counts[sequence] += 1
 
-            sequence = handle.readline()
-            plus = handle.readline()
-            quality = handle.readline()
-
-            if not sequence or not plus or not quality:
-                raise ValueError("Unexpected FASTQ structure: incomplete record detected")
-
-            sequence = sequence.strip()
-            if not is_valid_sequence(sequence):
-                skipped_reads += 1
-                continue
-
-            total_reads += 1
-            counts[sequence] = counts.get(sequence, 0) + 1
+        total_reads = handle.total
+        skipped_reads = handle.skipped
 
     ordered = sorted(counts.items(), key=lambda item: item[1], reverse=True)
     uniques = [
-        UniqueSequence(sequence=seq, count=count, length=len(seq), index=idx)
-        for idx, (seq, count) in enumerate(ordered)
+        UniqueSequence(sequence=seq, count=count)
+        for (seq, count) in ordered
     ]
     return uniques, total_reads, skipped_reads
-
-
-def write_unique_sequences_table(
-    sequences: Sequence[UniqueSequence], total_reads: int, output_path: Path
-) -> None:
-    """Persist unique sequences to a tab-delimited file."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="ascii") as handle:
-        writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["sequence", "count", "length", "frequency"])
-        for record in sequences:
-            frequency = record.count / total_reads if total_reads else 0.0
-            writer.writerow(
-                [
-                    record.sequence,
-                    str(record.count),
-                    str(record.length),
-                    f"{frequency:.12g}",
-                ]
-            )
-
-
-def read_unique_sequences_table(path: Path) -> tuple[list[UniqueSequence], int]:
-    """Load unique sequences written by step 1 and return records plus total reads."""
-    sequences: list[UniqueSequence] = []
-    total_reads = 0
-    with path.open("r", encoding="ascii") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        if reader.fieldnames is None:
-            raise ValueError(f"Missing header in {path}")
-        expected = {"sequence", "count", "length", "frequency"}
-        if set(reader.fieldnames) != expected:
-            raise ValueError(
-                f"Unexpected columns in {path}: {reader.fieldnames}"
-            )
-        for index, row in enumerate(reader):
-            sequence = row["sequence"].strip()
-            count = int(row["count"])
-            length = int(row["length"])
-            total_reads += count
-            sequences.append(
-                UniqueSequence(sequence=sequence, count=count, length=length, index=index)
-            )
-    return sequences, total_reads
-
-
-def ensure_directory(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def split_by_length(
@@ -107,17 +45,21 @@ def split_by_length(
     max_length: int | None,
 ) -> None:
     """Write per-length tables with summary headers."""
-    ensure_directory(output_dir)
+    # Group sequences by length
+    output_dir.mkdir(parents=True, exist_ok=True)
     grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
     for record in sequences:
-        if min_length is not None and record.length < min_length:
-            continue
-        if max_length is not None and record.length > max_length:
-            continue
-        grouped[record.length].append(record)
+        grouped[len(record.sequence)].append(record)
+
+    # Filter lengths outside the specified range
+    min_length = min_length or min(grouped.keys(), default=0)
+    max_length = max_length or max(grouped.keys(), default=0)
+    for length in list(grouped.keys()):
+        if length < min_length or length > max_length:
+            del grouped[length]
 
     for length, records in grouped.items():
-        length_path = output_dir / f"length_{length}.tsv"
+        length_path = output_dir / f"length_{length}.csv"
         length_reads = sum(r.count for r in records)
         with length_path.open("w", newline="", encoding="ascii") as handle:
             handle.write(
@@ -164,6 +106,7 @@ def load_sequences_for_length(
 def connect_sequences_same_length(
     sequences: Sequence[UniqueSequence], n_edits: int
 ) -> list[tuple[int, int]]:
+    """Find all pairs of sequences within an edit distance for same-length sequences."""
     if not sequences:
         return []
     partitions = generate_partitions(len(sequences[0].sequence), n_edits + 1)
@@ -184,6 +127,7 @@ def connect_sequences_different_length(
     sequences_b: Sequence[UniqueSequence],
     n_edits: int,
 ) -> list[tuple[int, int]]:
+    """Find all pairs of sequences within an edit distance for different-length sequences."""
     if not sequences_a or not sequences_b:
         return []
     len_a = len(sequences_a[0].sequence)
@@ -208,7 +152,9 @@ def connect_sequences_different_length(
             bucket_b = seed_to_bucket_b.get(seed)
             if not bucket_b:
                 continue
-            compare_buckets(list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges)
+            compare_buckets(
+                list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges
+            )
 
     return edges
 
@@ -245,8 +191,8 @@ def write_edge_file(
     distance: int,
     edges: Sequence[tuple[int, int]],
 ) -> Path:
-    ensure_directory(output_dir)
-    name = f"pairs_len{min(length_a, length_b)}_len{max(length_a, length_b)}_d{distance}.tsv"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    name = f"pairs_len{min(length_a, length_b)}_len{max(length_a, length_b)}_d{distance}.csv"
     path = output_dir / name
     with path.open("w", newline="", encoding="ascii") as handle:
         handle.write(
@@ -276,7 +222,7 @@ def run_unique(args) -> None:
     fastq_path = Path(args.fastq)
     output_path = Path(args.output)
     sequences, total_reads, skipped = collect_unique_sequences(fastq_path)
-    write_unique_sequences_table(sequences, total_reads, output_path)
+    write_sequences_table(sequences, output_path)
     print(
         f"Found {len(sequences):,} unique sequences "
         f"({total_reads:,} total reads, {skipped:,} skipped)."
@@ -287,7 +233,7 @@ def run_unique(args) -> None:
 def run_split(args) -> None:
     input_path = Path(args.input)
     output_dir = Path(args.output_dir)
-    sequences, total_reads = read_unique_sequences_table(input_path)
+    sequences, total_reads = read_sequences_table(input_path)
     split_by_length(
         sequences,
         total_reads,
@@ -307,11 +253,11 @@ def run_pairs(args) -> None:
     length_b = args.length_b
     distance = args.distance
 
-    sequences, _ = read_unique_sequences_table(unique_path)
+    sequences, _ = read_sequences_table(unique_path)
     sequence_map = {record.sequence: record for record in sequences}
 
-    file_a = length_dir / f"length_{length_a}.tsv"
-    file_b = length_dir / f"length_{length_b}.tsv"
+    file_a = length_dir / f"length_{length_a}.csv"
+    file_b = length_dir / f"length_{length_b}.csv"
 
     if not file_a.exists():
         raise FileNotFoundError(f"Missing per-length file: {file_a}")
@@ -342,7 +288,7 @@ def run_pairs(args) -> None:
 def run_cluster(args) -> None:
     unique_path = Path(args.unique)
     output_path = Path(args.output)
-    sequences, total_reads = read_unique_sequences_table(unique_path)
+    sequences, total_reads = read_sequences_table(unique_path)
     dsu = DisjointSetUnion(len(sequences))
 
     edges: list[tuple[int, int]] = []
