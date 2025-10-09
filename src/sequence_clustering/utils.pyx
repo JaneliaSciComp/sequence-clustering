@@ -57,6 +57,39 @@ def generate_partitions(int n, int k):
     return partitions
 
 
+cdef str reverse_complement(str seq, int start, int end):
+    """
+    Compute the reverse complement of a nucleotide sequence.
+
+    :param seq: The input nucleotide sequence.
+    :param start: Start index of the substring.
+    :param end: End index of the substring.
+    :returns: The reverse complement of the sequence between start and end indices.
+    """
+    cdef int i
+    cdef int n = end - start
+    cdef list rc = [''] * n
+    cdef str c
+
+    if n <= 0:
+        return ''
+
+    for i in range(n):
+        c = seq[end - 1 - i]
+        if c == 'A':
+            rc[i] = 'T'
+        elif c == 'T':
+            rc[i] = 'A'
+        elif c == 'C':
+            rc[i] = 'G'
+        elif c == 'G':
+            rc[i] = 'C'
+        else:
+            rc[i] = c
+
+    return ''.join(rc)
+
+
 def fill_buckets(sequences: list[UniqueSequence], int start, int end):
     """
     Fill buckets by hashing sequences based on a substring defined by start and end indices.
@@ -71,8 +104,12 @@ def fill_buckets(sequences: list[UniqueSequence], int start, int end):
     cdef object seq  # Use object instead of specific type
     cdef str seed
     
+    # Bin sequences into buckets based on part of the sequence
+    # or the same part of the reverse complement
     for idx, seq in enumerate(sequences):
         seed = seq.sequence[start:end]
+        seed_to_bucket[seed].append(idx)
+        seed = reverse_complement(seq.sequence, start, end)
         seed_to_bucket[seed].append(idx)
     return seed_to_bucket
 
@@ -110,3 +147,9 @@ def compare_buckets(
             distance = levenshtein(seq_i, seq_j, n_edits)
             if distance <= n_edits:
                 edges.append((i, j))
+            else:
+                # Also check against the reverse complement
+                reverse_seq_j = reverse_complement(seq_j, 0, len(seq_j))
+                distance = levenshtein(seq_i, reverse_seq_j, n_edits)
+                if distance <= n_edits:
+                    edges.append((i, j))
