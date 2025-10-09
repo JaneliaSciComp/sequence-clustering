@@ -159,8 +159,6 @@ def run_split(args) -> None:
     print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 
-
-
 def discover_length_files(length_dir: Path) -> dict[int, Path]:
     """Return mapping of sequence length to per-length CSV path."""
     pattern = re.compile(r"length_(\d+)\.csv")
@@ -172,6 +170,7 @@ def discover_length_files(length_dir: Path) -> dict[int, Path]:
         length = int(match.group(1))
         result[length] = candidate
     return result
+
 
 def run_pairs(args) -> None:
     """Find and write sequence pairs within a certain edit distance."""
@@ -252,20 +251,13 @@ def run_all_pairs(args) -> None:
 
     def launch_pair(length_a: int, length_b: int) -> None:
         cmd = [
-            sys.executable,
-            "-m",
-            "sequence_clustering",
-            "pairs",
-            "--length-dir",
-            str(length_dir),
-            "--length-a",
-            str(length_a),
-            "--length-b",
-            str(length_b),
-            "--distance",
-            str(args.distance),
-            "--output-dir",
-            str(output_dir),
+            sys.executable, "-m",
+            "sequence_clustering", "pairs",
+            "--length-dir", str(length_dir),
+            "--length-a", str(length_a),
+            "--length-b", str(length_b),
+            "--distance", str(args.distance),
+            "--output-dir", str(output_dir),
         ]
         subprocess.run(cmd, check=True)
 
@@ -281,9 +273,10 @@ def run_all_pairs(args) -> None:
                 raise RuntimeError(
                     f"pairs command failed for lengths ({a}, {b})"
                 ) from exc
-    
+
     print(f"Processed {len(pairs):,} length pairs with {max_workers} workers.")
     print(f"Time elapsed: {time.time() - start:.2g} seconds")
+
 
 def run_cluster(args) -> None:
     """Assemble clusters from edge lists and write representatives."""
@@ -294,14 +287,17 @@ def run_cluster(args) -> None:
     sequences = read_sequences_table(unique_path)
     dsu = DisjointSetUnion(len(sequences))
 
-    edges: list[tuple[int, int]] = []
+    # Read all edge files and union connected sequences
+    n_edges = 0
     for edge_file in edges_path.glob("*.csv"):
         edge_path = Path(edge_file)
         file_edges = read_edge_file(edge_path)
         for u, v in file_edges:
             dsu.union(u, v)
-        edges.extend(file_edges)
+        n_edges += len(file_edges)
 
+    # Generate clusters (connected components of the graph)
+    # Choose most abundant sequence as representative
     components = dsu.get_components()
     clusters: list[tuple[str, int, int]] = []
     for component in components:
@@ -310,8 +306,10 @@ def run_cluster(args) -> None:
         representative = sequences[representative_idx].sequence
         clusters.append((representative, len(component), total_count))
 
+    # Sort clusters by total count (descending)
     clusters.sort(key=lambda item: item[2], reverse=True)
 
+    # Write cluster representatives to output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="ascii") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -320,7 +318,7 @@ def run_cluster(args) -> None:
             writer.writerow([representative, str(cluster_size), str(total_count)])
 
     print(
-        f"Processed {len(sequences):,} sequences with {len(edges):,} edges into "
+        f"Processed {len(sequences):,} sequences with {n_edges:,} edges into "
         f"{len(clusters):,} clusters."
     )
     print(f"Wrote cluster representatives to {output_path}")

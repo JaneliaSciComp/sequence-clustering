@@ -19,6 +19,7 @@ The project is implemented in Python and Cython and uses `uv` for dependency man
 
 3. Run the code: `uv run -m sequence_clustering -h`
 
+Note: to recompile the Cython code after changes, run `uv sync --reinstall`.
 
 ## Usage
 
@@ -35,7 +36,7 @@ The full pipeline consists of multiple steps:
 
 3. Find all pairs of sequences within max_edits of each other:
    ```
-   uv run -m sequence_clustering all-pairs --length-dir lengths --length-a 25 --length-b 26 lengths --output-dir pairs --max-edits 2 --workers 4
+   uv run -m sequence_clustering all-pairs --length-dir lengths --output-dir pairs --max-edits 2 --workers 4
    ```
    Optionally, the pairwise comparisons can be run separately:
    ```
