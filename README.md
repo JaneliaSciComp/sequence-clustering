@@ -19,6 +19,7 @@ The project is implemented in Python and Cython and uses `uv` for dependency man
 
 3. Run the code: `uv run -m sequence_clustering -h`
 
+Note: to recompile the Cython code after changes, run `uv sync --reinstall`.
 
 ## Usage
 
