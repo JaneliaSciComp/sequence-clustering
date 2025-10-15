@@ -182,8 +182,8 @@ def run_pairs(args) -> None:
 
     # Read headers of all files to compute offsets
     length_to_n = {}
-    for file in length_dir.glob("length_*.csv"):
-        length = int(re.match(r"length_(\d+)\.csv", file.name).group(1))
+    length_files = discover_length_files(length_dir)
+    for length, file in length_files.items():
         n_sequences, _ = extract_counts(file)
         length_to_n[length] = n_sequences
     offset_a = sum(
@@ -223,13 +223,38 @@ def run_pairs(args) -> None:
     print(f"({length_a}, {length_b}): Time elapsed: {time.time() - start:.2g} seconds")
 
 
-def generate_length_pairs(lengths: list[int], max_distance: int) -> list[tuple[int, int]]:
+def read_n_sequences_for_lengths(length_files: dict[int, Path]) -> dict[int, int]:
+    """Return mapping of sequence length to number of sequences."""
+    result: dict[int, int] = {}
+    for length, file in length_files.items():
+        # Find file to parse
+        # Read header line "# unique_sequences=xxx, total_reads=yyy"
+        with file.open("r", encoding="ascii") as f:
+            first_line = f.readline()
+            m = re.match(r"# unique_sequences=(\d+),", first_line)
+            if not m:
+                raise ValueError(f"Header line missing or malformed in {file}")
+            n_sequences = int(m.group(1))
+        result[length] = n_sequences
+    return result
+
+
+def generate_length_pairs(
+    lengths: Sequence[int], length_to_count: dict[int, int], max_distance: int
+) -> list[tuple[int, int]]:
     """Return all length pairs (a <= b) within the given distance."""
     pairs: list[tuple[int, int]] = []
+    lengths = list(sorted(lengths))
     for i, a in enumerate(lengths):
         for b in lengths[i:]:
             if abs(a - b) <= max_distance:
                 pairs.append((a, b))
+
+    # Sort them by the expected number of comparisons (product of counts)
+    pairs.sort(
+        key=lambda ab: length_to_count[ab[0]] * length_to_count[ab[1]],
+        reverse=True
+    )
     return pairs
 
 
@@ -241,8 +266,8 @@ def run_all_pairs(args) -> None:
     max_workers = max(args.workers, 1)
 
     length_files = discover_length_files(length_dir)
-    lengths = sorted(length_files)
-    pairs = generate_length_pairs(lengths, args.distance)
+    length_to_count = read_n_sequences_for_lengths(length_files)
+    pairs = generate_length_pairs(length_files.keys(), length_to_count,args.distance)
     if not pairs:
         print("No eligible length pairs found.")
         return
