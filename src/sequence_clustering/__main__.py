@@ -1,6 +1,6 @@
 import argparse
 
-from .cmd import run_all_pairs, run_cluster, run_pairs, run_split, run_unique
+from .cmd import run_cluster, run_split, run_unique
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,74 +50,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     split_parser.set_defaults(func=run_split)
 
-    # Subcommand: pairs
-    pairs_parser = subparsers.add_parser(
-        "pairs", help="Find sequence pairs within an edit distance"
-    )
-    pairs_parser.add_argument(
-        "--length-dir",
-        required=True,
-        help="Directory containing per-length CSV files",
-    )
-    pairs_parser.add_argument(
-        "--length-a", type=int, required=True, help="First sequence length"
-    )
-    pairs_parser.add_argument(
-        "--length-b", type=int, required=True, help="Second sequence length"
-    )
-    pairs_parser.add_argument(
-        "--distance", "-d", type=int, required=True, help="Maximum edit distance"
-    )
-    pairs_parser.add_argument(
-        "--output-dir", "-o",
-        required=True,
-        help="Directory to write the edge list",
-    )
-    pairs_parser.set_defaults(func=run_pairs)
-
-    # Subcommand: all-pairs
-    all_pairs_parser = subparsers.add_parser(
-        "all-pairs",
-        help="Run pairs for all length combinations within an edit distance",
-    )
-    all_pairs_parser.add_argument(
-        "--length-dir",
-        required=True,
-        help="Directory containing per-length CSV files",
-    )
-    all_pairs_parser.add_argument(
-        "--distance", "-d",
-        type=int,
-        required=True,
-        help="Maximum difference between lengths",
-    )
-    all_pairs_parser.add_argument(
-        "--output-dir", "-o",
-        required=True,
-        help="Directory to write the edge lists",
-    )
-    all_pairs_parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=1,
-        help="Number of subprocesses to run in parallel (default: 1)",
-    )
-    all_pairs_parser.set_defaults(func=run_all_pairs)
-
     # Subcommand: cluster
     cluster_parser = subparsers.add_parser(
-        "cluster", help="Assemble clusters from edge lists"
+        "cluster", help="Compute edges with Dask and assemble clusters"
     )
     cluster_parser.add_argument(
         "--unique", required=True, help="CSV file with global unique sequences"
     )
     cluster_parser.add_argument(
-        "--edges-dir",
+        "--length-store",
         required=True,
-        help="Directory containing edge list files produced by the pairs subcommand",
+        help="Zarr store produced by the split subcommand",
+    )
+    cluster_parser.add_argument(
+        "--distance", "-d",
+        type=int,
+        required=True,
+        help="Maximum edit distance",
     )
     cluster_parser.add_argument(
         "--output", "-o", required=True, help="Output CSV for cluster representatives"
+    )
+    cluster_parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=0,
+        help="Number of Dask workers to launch (default: auto)",
+    )
+    cluster_parser.add_argument(
+        "--threads-per-worker",
+        type=int,
+        default=0,
+        help="Threads per Dask worker (default: auto)",
     )
     cluster_parser.set_defaults(func=run_cluster)
 

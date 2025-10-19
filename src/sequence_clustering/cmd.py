@@ -1,7 +1,4 @@
-import concurrent.futures
 import csv
-import subprocess
-import sys
 import re
 import time
 from collections import defaultdict
@@ -10,15 +7,13 @@ from typing import Sequence
 
 import numpy as np
 import zarr
+from dask.distributed import Client, LocalCluster, as_completed
 
 from .dsu import DisjointSetUnion
 from .types import UniqueSequence
 from .io import (
     read_sequences_table,
     write_sequences_table,
-    read_edge_file,
-    write_edge_file,
-    extract_counts,
     FastQReader,
 )
 from .utils import (
@@ -26,7 +21,6 @@ from .utils import (
     fill_buckets,
     generate_partitions,
 )
-
 
 def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], int, int]:
     """Return unique sequences, total reads, and skipped reads from a FASTQ file."""
@@ -236,86 +230,6 @@ def run_split(args) -> None:
     print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 
-def discover_length_files(length_dir: Path) -> dict[int, Path]:
-    """Return mapping of sequence length to per-length CSV path."""
-    pattern = re.compile(r"length_(\d+)\.csv")
-    result: dict[int, Path] = {}
-    for candidate in sorted(length_dir.glob("length_*.csv")):
-        match = pattern.fullmatch(candidate.name)
-        if not match:
-            raise ValueError(f"Unexpected per-length filename: {candidate}")
-        length = int(match.group(1))
-        result[length] = candidate
-    return result
-
-
-def run_pairs(args) -> None:
-    """Find and write sequence pairs within a certain edit distance."""
-    start = time.time()
-    length_dir = Path(args.length_dir)
-    length_a = min(args.length_a, args.length_b)
-    length_b = max(args.length_a, args.length_b)
-    distance = args.distance
-
-    # Read headers of all files to compute offsets
-    length_to_n = {}
-    length_files = discover_length_files(length_dir)
-    for length, file in length_files.items():
-        n_sequences, _ = extract_counts(file)
-        length_to_n[length] = n_sequences
-    offset_a = sum(
-        n for length, n in length_to_n.items() if length < length_a
-    )
-    offset_b = sum(
-        n for length, n in length_to_n.items() if length < length_b
-    )
-
-    # Load all sequences with given lengths
-    file_a = length_dir / f"length_{length_a}.csv"
-    file_b = length_dir / f"length_{length_b}.csv"
-
-    if not file_a.exists():
-        raise FileNotFoundError(f"Missing per-length file: {file_a}")
-    if not file_b.exists():
-        raise FileNotFoundError(f"Missing per-length file: {file_b}")
-
-    seqs_a = read_sequences_table(file_a)
-    seqs_b = read_sequences_table(file_b)
-
-    same_length = length_a == length_b
-    if same_length:
-        raw_edges = connect_sequences_same_length(seqs_a, distance, offset_a)
-    else:
-        raw_edges = connect_sequences_different_length(
-            seqs_a, seqs_b, distance, offset_a, offset_b
-        )
-    edges = list(set(raw_edges))  # Remove duplicates
-
-    output_path = Path(args.output_dir) / f"pairs_len{length_a}_len{length_b}_d{distance}.csv"
-    write_edge_file(output_path, edges)
-    print(
-        f"({length_a}, {length_b}): Found {len(edges):,} pairs within distance {distance} "
-    )
-    print(f"({length_a}, {length_b}): Wrote edge list to {output_path}")
-    print(f"({length_a}, {length_b}): Time elapsed: {time.time() - start:.2g} seconds")
-
-
-def read_n_sequences_for_lengths(length_files: dict[int, Path]) -> dict[int, int]:
-    """Return mapping of sequence length to number of sequences."""
-    result: dict[int, int] = {}
-    for length, file in length_files.items():
-        # Find file to parse
-        # Read header line "# unique_sequences=xxx, total_reads=yyy"
-        with file.open("r", encoding="ascii") as f:
-            first_line = f.readline()
-            m = re.match(r"# unique_sequences=(\d+),", first_line)
-            if not m:
-                raise ValueError(f"Header line missing or malformed in {file}")
-            n_sequences = int(m.group(1))
-        result[length] = n_sequences
-    return result
-
-
 def generate_length_pairs(
     lengths: Sequence[int], length_to_count: dict[int, int], max_distance: int
 ) -> list[tuple[int, int]]:
@@ -335,71 +249,171 @@ def generate_length_pairs(
     return pairs
 
 
-def run_all_pairs(args) -> None:
-    """Run pairs for all length combinations within an edit distance."""
-    start = time.time()
-    length_dir = Path(args.length_dir)
-    output_dir = Path(args.output_dir)
-    max_workers = max(args.workers, 1)
+def load_length_groups(
+    length_store: Path,
+    sequence_to_index: dict[str, int],
+) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]], dict[int, int]]:
+    """Load per-length sequences and map them back to global indices."""
+    store = zarr.open_group(length_store.absolute(), mode="r")
+    pattern = re.compile(r"length_(\d+)")
 
-    length_files = discover_length_files(length_dir)
-    length_to_count = read_n_sequences_for_lengths(length_files)
-    pairs = generate_length_pairs(length_files.keys(), length_to_count,args.distance)
-    if not pairs:
-        print("No eligible length pairs found.")
-        return
+    sequences_by_length: dict[int, list[UniqueSequence]] = {}
+    indices_by_length: dict[int, list[int]] = {}
+    counts_by_length: dict[int, int] = {}
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, group in store.groups():
+        match = pattern.fullmatch(name)
+        if not match:
+            continue
+        length = int(match.group(1))
+        seq_array = group["sequence"][:]
+        count_array = group["count"][:]
+        seq_list = seq_array.tolist()
+        count_list = count_array.tolist()
 
-    def launch_pair(length_a: int, length_b: int) -> None:
-        cmd = [
-            sys.executable, "-m",
-            "sequence_clustering", "pairs",
-            "--length-dir", str(length_dir),
-            "--length-a", str(length_a),
-            "--length-b", str(length_b),
-            "--distance", str(args.distance),
-            "--output-dir", str(output_dir),
+        sequences_list = [
+            UniqueSequence(sequence=str(seq), count=int(cnt))
+            for seq, cnt in zip(seq_list, count_list, strict=True)
         ]
-        subprocess.run(cmd, check=True)
+        if not sequences_list:
+            continue
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_pair = {
-            executor.submit(launch_pair, a, b): (a, b) for a, b in pairs
-        }
-        for future in concurrent.futures.as_completed(future_to_pair):
-            a, b = future_to_pair[future]
-            try:
-                future.result()
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"pairs command failed for lengths ({a}, {b})"
-                ) from exc
+        indices: list[int] = []
+        for seq in seq_list:
+            idx = sequence_to_index.get(seq)
+            if idx is None:
+                raise ValueError(
+                    f"Sequence {seq!r} in group {name!r} not found in unique table."
+                )
+            indices.append(idx)
 
-    print(f"Processed {len(pairs):,} length pairs with {max_workers} workers.")
-    print(f"Time elapsed: {time.time() - start:.2g} seconds")
+        sequences_by_length[length] = sequences_list
+        indices_by_length[length] = indices
+        counts_by_length[length] = len(sequences_list)
+
+    return sequences_by_length, indices_by_length, counts_by_length
+
+
+def compute_edges_for_pair(
+    sequences_a: Sequence[UniqueSequence],
+    sequences_b: Sequence[UniqueSequence],
+    n_edits: int,
+    same_length: bool,
+) -> list[tuple[int, int]]:
+    """Return local index pairs within edit distance between two length buckets."""
+    if same_length:
+        edges = connect_sequences_same_length(sequences_a, n_edits, 0)
+    else:
+        edges = connect_sequences_different_length(sequences_a, sequences_b, n_edits, 0, 0)
+    return list(set(edges))
 
 
 def run_cluster(args) -> None:
-    """Assemble clusters from edge lists and write representatives."""
+    """Build clusters by computing edges with Dask and unioning them locally."""
     start = time.time()
     unique_path = Path(args.unique)
-    edges_path = Path(args.edges_dir)
+    length_store = Path(args.length_store)
     output_path = Path(args.output)
+    n_edits = args.distance
+
     sequences = read_sequences_table(unique_path)
+    if not sequences:
+        raise ValueError(f"No sequences found in {unique_path}")
+
+    sequence_to_index = {
+        record.sequence: idx for idx, record in enumerate(sequences)
+    }
+
+    (
+        sequences_by_length,
+        indices_by_length,
+        counts_by_length,
+    ) = load_length_groups(length_store, sequence_to_index)
+
+    if not sequences_by_length:
+        raise ValueError(
+            f"No per-length groups found in {length_store}. "
+            "Run the split command first."
+        )
+
+    pairs = generate_length_pairs(
+        sequences_by_length.keys(),
+        counts_by_length,
+        n_edits,
+    )
+
     dsu = DisjointSetUnion(len(sequences))
-
-    # Read all edge files and union connected sequences
     n_edges = 0
-    for edge_file in edges_path.glob("*.csv"):
-        edge_path = Path(edge_file)
-        file_edges = read_edge_file(edge_path)
-        for u, v in file_edges:
-            dsu.union(u, v)
-        n_edges += len(file_edges)
 
-    # Generate clusters (connected components of the graph)
-    # Choose most abundant sequence as representative
+    client: Client | None = None
+    cluster: LocalCluster | None = None
+    futures = {}
+
+    try:
+        if pairs:
+            cluster = LocalCluster(
+                n_workers=args.workers or None,
+                threads_per_worker=args.threads_per_worker or None,
+                dashboard_address=None,
+            )
+            client = Client(cluster)
+            nthreads = client.nthreads()
+            print(
+                f"Started local Dask cluster with {len(nthreads)} workers "
+                f"and thread distribution {sorted(nthreads.values())}."
+            )
+
+            scattered_sequences = {
+                length: client.scatter(seqs, broadcast=True)
+                for length, seqs in sequences_by_length.items()
+            }
+
+            for length_a, length_b in pairs:
+                future = client.submit(
+                    compute_edges_for_pair,
+                    scattered_sequences[length_a],
+                    scattered_sequences[length_b],
+                    n_edits,
+                    length_a == length_b,
+                    pure=False,
+                )
+                futures[future] = (length_a, length_b)
+
+            for future in as_completed(futures):
+                length_a, length_b = futures[future]
+                same_length = length_a == length_b
+                try:
+                    local_edges = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"Failed to compute edges for lengths ({length_a}, {length_b})"
+                    ) from exc
+
+                indices_a = indices_by_length[length_a]
+                indices_b = indices_by_length[length_b]
+
+                for local_a, local_b in local_edges:
+                    global_a = indices_a[local_a]
+                    global_b = indices_a[local_b] if same_length else indices_b[local_b]
+                    dsu.union(global_a, global_b)
+
+                n_edges += len(local_edges)
+                print(
+                    f"Length pair ({length_a}, {length_b}) produced {len(local_edges):,} edges."
+                )
+
+        else:
+            print("No length pairs within the requested distance. Skipping edge computation.")
+
+    finally:
+        for future in list(futures):
+            future.release()
+        futures.clear()
+        if client is not None:
+            client.close()
+        if cluster is not None:
+            cluster.close()
+
     components = dsu.get_components()
     clusters: list[tuple[str, int, int]] = []
     for component in components:
@@ -408,10 +422,8 @@ def run_cluster(args) -> None:
         representative = sequences[representative_idx].sequence
         clusters.append((representative, len(component), total_count))
 
-    # Sort clusters by total count (descending)
     clusters.sort(key=lambda item: item[2], reverse=True)
 
-    # Write cluster representatives to output file
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="ascii") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -419,9 +431,10 @@ def run_cluster(args) -> None:
         for representative, cluster_size, total_count in clusters:
             writer.writerow([representative, str(cluster_size), str(total_count)])
 
+    elapsed = time.time() - start
     print(
-        f"Processed {len(sequences):,} sequences with {n_edges:,} edges into "
-        f"{len(clusters):,} clusters."
+        f"Processed {len(sequences):,} sequences with {n_edges:,} edges "
+        f"into {len(clusters):,} clusters."
     )
     print(f"Wrote cluster representatives to {output_path}")
-    print(f"Time elapsed: {time.time() - start:.2g} seconds")
+    print(f"Time elapsed: {elapsed:.2g} seconds")
