@@ -84,11 +84,7 @@ def run_cluster(args) -> None:
         record.sequence: idx for idx, record in enumerate(sequences)
     }
 
-    (
-        sequences_by_length,
-        indices_by_length,
-        counts_by_length,
-    ) = load_length_groups(length_store, sequence_to_index)
+    sequences_by_length, indices_by_length = load_length_groups(length_store, sequence_to_index)
 
     if not sequences_by_length:
         raise ValueError(
@@ -98,7 +94,6 @@ def run_cluster(args) -> None:
 
     pairs = generate_length_pairs(
         sequences_by_length.keys(),
-        counts_by_length,
         n_edits,
     )
 
@@ -297,7 +292,7 @@ def split_by_length(
 
 
 def generate_length_pairs(
-    lengths: Sequence[int], length_to_count: dict[int, int], max_distance: int
+    lengths: Sequence[int], max_distance: int
 ) -> list[tuple[int, int]]:
     """Return all length pairs (a <= b) within the given distance."""
     pairs: list[tuple[int, int]] = []
@@ -307,25 +302,19 @@ def generate_length_pairs(
             if abs(a - b) <= max_distance:
                 pairs.append((a, b))
 
-    # Sort them by the expected number of comparisons (product of counts)
-    pairs.sort(
-        key=lambda ab: length_to_count[ab[0]] * length_to_count[ab[1]],
-        reverse=True
-    )
     return pairs
 
 
 def load_length_groups(
     length_store: Path,
     sequence_to_index: dict[str, int],
-) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]], dict[int, int]]:
+) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]]]:
     """Load per-length sequences and map them back to global indices."""
     store = zarr.open_group(str(length_store), mode="r")
     pattern = re.compile(r"length_(\d+)")
 
     sequences_by_length: dict[int, list[UniqueSequence]] = {}
     indices_by_length: dict[int, list[int]] = {}
-    counts_by_length: dict[int, int] = {}
 
     for name, group in store.groups():
         match = pattern.fullmatch(name)
@@ -355,9 +344,8 @@ def load_length_groups(
 
         sequences_by_length[length] = sequences_list
         indices_by_length[length] = indices
-        counts_by_length[length] = len(sequences_list)
 
-    return sequences_by_length, indices_by_length, counts_by_length
+    return sequences_by_length, indices_by_length
 
 
 def compute_edges_for_pair(
