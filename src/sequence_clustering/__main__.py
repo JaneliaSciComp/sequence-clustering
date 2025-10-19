@@ -1,6 +1,6 @@
 import argparse
 
-from .cmd import run_cluster, run_split, run_unique
+from .cmd import run_cluster, run_unique
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,45 +22,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unique_parser.set_defaults(func=run_unique)
 
-    # Subcommand: split
-    split_parser = subparsers.add_parser(
-        "split", help="Split input sequences into per-length Zarr groups"
-    )
-    split_parser.add_argument(
-        "--input", "-i", required=True, help="Unique CSV from step 1"
-    )
-    split_parser.add_argument(
-        "--output", "-o", required=True, help="Output Zarr store path"
-    )
-    split_parser.add_argument(
-        "--sequence-column",
-        default="sequence",
-        help="Column name containing sequence strings (default: sequence)",
-    )
-    split_parser.add_argument(
-        "--count-column",
-        default="count",
-        help="Column name containing sequence counts (default: count)",
-    )
-    split_parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=10000,
-        help="Chunk size to use when writing arrays (default: 10000)",
-    )
-    split_parser.set_defaults(func=run_split)
-
     # Subcommand: cluster
     cluster_parser = subparsers.add_parser(
         "cluster", help="Compute edges with Dask and assemble clusters"
     )
     cluster_parser.add_argument(
-        "--unique", required=True, help="CSV file with global unique sequences"
+        "--input", "-i", required=True, help="CSV file with global unique sequences"
     )
     cluster_parser.add_argument(
         "--length-store",
-        required=True,
-        help="Zarr store produced by the split subcommand",
+        help="Optional override for the per-length Zarr store (default: by_length.zarr)",
     )
     cluster_parser.add_argument(
         "--distance", "-d",
@@ -70,6 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cluster_parser.add_argument(
         "--output", "-o", required=True, help="Output CSV for cluster representatives"
+    )
+    cluster_parser.add_argument(
+        "--sequence-column",
+        default="sequence",
+        help="Column name containing sequence strings (default: sequence)",
+    )
+    cluster_parser.add_argument(
+        "--count-column",
+        default="count",
+        help="Column name containing sequence counts (default: count)",
+    )
+    cluster_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10000,
+        help="Chunk size to use when writing Zarr arrays (default: 10000)",
     )
     cluster_parser.add_argument(
         "--workers", "-w",

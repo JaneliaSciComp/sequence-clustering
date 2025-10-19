@@ -12,7 +12,6 @@ from dask.distributed import Client, LocalCluster, as_completed
 from .dsu import DisjointSetUnion
 from .types import UniqueSequence
 from .io import (
-    read_sequences_table,
     write_sequences_table,
     FastQReader,
 )
@@ -96,6 +95,7 @@ def split_by_length(
     chunk_size: int,
 ) -> None:
     """Write per-length tables into a Zarr store with a group per length."""
+    chunk_size = max(1, chunk_size)
     output_store.parent.mkdir(parents=True, exist_ok=True)
 
     grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
@@ -103,7 +103,7 @@ def split_by_length(
         grouped[len(record.sequence)].append(record)
 
     sorted_grouped = dict(sorted(grouped.items()))
-    root = zarr.open_group(output_store.absolute(), mode="w")
+    root = zarr.open_group(str(output_store), mode="w")
 
     total_sequences = len(sequences)
     total_reads = sum(record.count for record in sequences)
@@ -254,7 +254,7 @@ def load_length_groups(
     sequence_to_index: dict[str, int],
 ) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]], dict[int, int]]:
     """Load per-length sequences and map them back to global indices."""
-    store = zarr.open_group(length_store.absolute(), mode="r")
+    store = zarr.open_group(str(length_store), mode="r")
     pattern = re.compile(r"length_(\d+)")
 
     sequences_by_length: dict[int, list[UniqueSequence]] = {}
@@ -311,14 +311,24 @@ def compute_edges_for_pair(
 def run_cluster(args) -> None:
     """Build clusters by computing edges with Dask and unioning them locally."""
     start = time.time()
-    unique_path = Path(args.unique)
-    length_store = Path(args.length_store)
+    unique_path = Path(args.input)
+    if args.length_store:
+        length_store = Path(args.length_store)
+    else:
+        length_store = unique_path.parent / "by_length.zarr"
     output_path = Path(args.output)
     n_edits = args.distance
 
-    sequences = read_sequences_table(unique_path)
+    sequences = read_sequences_table_with_columns(
+        unique_path,
+        sequence_column=args.sequence_column,
+        count_column=args.count_column,
+    )
     if not sequences:
         raise ValueError(f"No sequences found in {unique_path}")
+
+    split_by_length(sequences, length_store, args.chunk_size)
+    print(f"Wrote per-length Zarr store to {length_store}")
 
     sequence_to_index = {
         record.sequence: idx for idx, record in enumerate(sequences)
