@@ -90,7 +90,7 @@ cdef str reverse_complement(str seq, int start, int end):
     return ''.join(rc)
 
 
-def fill_buckets(sequences: list[UniqueSequence], int start, int end):
+def fill_buckets(sequences: list[str], int start, int end):
     """
     Fill buckets by hashing sequences based on a substring defined by start and end indices.
 
@@ -107,9 +107,9 @@ def fill_buckets(sequences: list[UniqueSequence], int start, int end):
     # Bin sequences into buckets based on part of the sequence
     # or the same part of the reverse complement
     for idx, seq in enumerate(sequences):
-        seed = seq.sequence[start:end]
+        seed = seq[start:end]
         seed_to_bucket[seed].append(idx)
-        seed = reverse_complement(seq.sequence, start, end)
+        seed = reverse_complement(seq, start, end)
         seed_to_bucket[seed].append(idx)
     return seed_to_bucket
 
@@ -117,8 +117,8 @@ def fill_buckets(sequences: list[UniqueSequence], int start, int end):
 def compare_buckets(
     bucket_a: list[int],
     bucket_b: list[int],
-    sequences_a: list[UniqueSequence],
-    sequences_b: list[UniqueSequence],
+    sequences_a: list[str],
+    sequences_b: list[str],
     int n_edits,
     edges: list[tuple[int, int]],
 ):
@@ -138,10 +138,10 @@ def compare_buckets(
     
     while bucket_a:
         i = bucket_a.pop()
-        seq_i = sequences_a[i].sequence
+        seq_i = sequences_a[i]
 
         for j in bucket_b:
-            seq_j = sequences_b[j].sequence
+            seq_j = sequences_b[j]
             
             # Use the levenshtein function with early termination
             distance = levenshtein(seq_i, seq_j, n_edits)

@@ -62,42 +62,29 @@ def run_cluster(args) -> None:
     """Build clusters by computing edges with Dask and unioning them locally."""
     start = time.time()
     unique_path = Path(args.input)
-    if args.length_store:
-        length_store = Path(args.length_store)
-    else:
-        length_store = unique_path.parent / "by_length.zarr"
+    length_store = args.length_store or unique_path.parent / "by_length.zarr"
     output_path = Path(args.output)
     n_edits = args.distance
 
-    sequences = read_sequences_table_with_columns(
+    # Split sequences by length to make accessing them easier
+    print(f"Loading unique sequences from '{unique_path}'...")
+    split_by_length(
         unique_path,
+        length_store,
+        chunk_size=args.chunk_size,
         sequence_column=args.sequence_column,
         count_column=args.count_column,
     )
-    if not sequences:
-        raise ValueError(f"No sequences found in {unique_path}")
+    print(f"Wrote per-length Zarr store to '{length_store}'")
 
-    split_by_length(sequences, length_store, args.chunk_size)
-    print(f"Wrote per-length Zarr store to {length_store}")
+    # Generate all sequence pairs to compare
+    length_to_offset, total_count = load_offsets(length_store)
+    pairs = generate_length_pairs(length_to_offset.keys(), n_edits)
+    if not pairs:
+        print("No length pairs within the requested distance.")
+        return
 
-    sequence_to_index = {
-        record.sequence: idx for idx, record in enumerate(sequences)
-    }
-
-    sequences_by_length, indices_by_length = load_length_groups(length_store, sequence_to_index)
-
-    if not sequences_by_length:
-        raise ValueError(
-            f"No per-length groups found in {length_store}. "
-            "Run the split command first."
-        )
-
-    pairs = generate_length_pairs(
-        sequences_by_length.keys(),
-        n_edits,
-    )
-
-    dsu = DisjointSetUnion(len(sequences))
+    dsu = DisjointSetUnion(total_count)
     n_edges = 0
 
     client: Client | None = None
@@ -105,60 +92,46 @@ def run_cluster(args) -> None:
     futures = {}
 
     try:
-        if pairs:
-            cluster = LocalCluster(
-                n_workers=args.workers or None,
-                threads_per_worker=args.threads_per_worker or None,
-                dashboard_address=None,
+        # Start a local Dask cluster
+        cluster = LocalCluster(
+            n_workers=args.workers or None,
+            threads_per_worker=args.threads_per_worker or None,
+            dashboard_address=None,
+        )
+        client = Client(cluster)
+        nthreads = client.nthreads()
+        print(
+            f"Started local Dask cluster with {len(nthreads)} workers "
+            f"and thread distribution {sorted(nthreads.values())}."
+        )
+
+        # Submit all length pairs as separate tasks
+        for length_a, length_b in pairs:
+            future = client.submit(
+                compute_edges_for_pair,
+                length_store,
+                length_a,
+                length_b,
+                n_edits,
             )
-            client = Client(cluster)
-            nthreads = client.nthreads()
+            futures[future] = (length_a, length_b)
+
+        # Collect results as they complete and aggregate edges
+        for future, local_edges in as_completed(futures, with_results=True):
+            length_a, length_b = futures[future]
+
+            offset_a = length_to_offset[length_a]
+            offset_b = length_to_offset[length_b]
+
+            for local_a, local_b in local_edges:
+                global_a = local_a + offset_a
+                global_b = local_b + offset_b
+                dsu.union(global_a, global_b)
+
+            n_edges += len(local_edges)
             print(
-                f"Started local Dask cluster with {len(nthreads)} workers "
-                f"and thread distribution {sorted(nthreads.values())}."
+                f"Length pair ({length_a}, {length_b}) produced {len(local_edges):,} edges."
             )
-
-            scattered_sequences = {
-                length: client.scatter(seqs, broadcast=True)
-                for length, seqs in sequences_by_length.items()
-            }
-
-            for length_a, length_b in pairs:
-                future = client.submit(
-                    compute_edges_for_pair,
-                    scattered_sequences[length_a],
-                    scattered_sequences[length_b],
-                    n_edits,
-                    length_a == length_b,
-                    pure=False,
-                )
-                futures[future] = (length_a, length_b)
-
-            for future in as_completed(futures):
-                length_a, length_b = futures[future]
-                same_length = length_a == length_b
-                try:
-                    local_edges = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"Failed to compute edges for lengths ({length_a}, {length_b})"
-                    ) from exc
-
-                indices_a = indices_by_length[length_a]
-                indices_b = indices_by_length[length_b]
-
-                for local_a, local_b in local_edges:
-                    global_a = indices_a[local_a]
-                    global_b = indices_a[local_b] if same_length else indices_b[local_b]
-                    dsu.union(global_a, global_b)
-
-                n_edges += len(local_edges)
-                print(
-                    f"Length pair ({length_a}, {length_b}) produced {len(local_edges):,} edges."
-                )
-
-        else:
-            print("No length pairs within the requested distance. Skipping edge computation.")
 
     finally:
         for future in list(futures):
@@ -169,16 +142,32 @@ def run_cluster(args) -> None:
         if cluster is not None:
             cluster.close()
 
-    components = dsu.get_components()
-    clusters: list[tuple[str, int, int]] = []
-    for component in components:
-        total_count = sum(sequences[idx].count for idx in component)
-        representative_idx = max(component, key=lambda idx: sequences[idx].count)
-        representative = sequences[representative_idx].sequence
-        clusters.append((representative, len(component), total_count))
+    # Load all read counts for cluster assembly
+    counts = np.zeros(total_count, dtype=np.int64)
+    for length in length_to_offset:
+        local_counts = load_length_counts(length_store, length)
+        start_idx = length_to_offset[length]
+        end_idx = start_idx + len(local_counts)
+        counts[start_idx:end_idx] = local_counts
 
+    # Assemble clusters from the union-find structure
+    components = dsu.get_components()
+    clusters: list[tuple[int, int, int]] = []
+    for component in components:
+        total_count = sum(counts[idx] for idx in component)
+        representative_idx = max(component, key=lambda idx: counts[idx])
+        clusters.append((representative_idx, len(component), total_count))
+
+    # Dereference representative sequences (and sort by total count)
+    del dsu
+    sequences = read_sequences_table(unique_path, args.sequence_column, args.count_column)
+    clusters = [
+        (sequences[rep_idx].sequence, cluster_size, total_count)
+        for rep_idx, cluster_size, total_count in clusters
+    ]
     clusters.sort(key=lambda item: item[2], reverse=True)
 
+    # Write out cluster representatives
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="ascii") as handle:
         writer = csv.writer(handle, delimiter="\t")
@@ -195,7 +184,66 @@ def run_cluster(args) -> None:
     print(f"Time elapsed: {elapsed:.2g} seconds")
 
 
-def read_sequences_table_with_columns(
+def split_by_length(
+    input_file: Path,
+    output_store: Path,
+    chunk_size: int,
+    sequence_column: str,
+    count_column: str,
+) -> None:
+    """Write per-length tables into a Zarr store with a group per length."""
+    chunk_size = max(1, chunk_size)
+    output_store.parent.mkdir(parents=True, exist_ok=True)
+    root = zarr.open_group(str(output_store), mode="w")
+
+    # Read all sequences from the input csv file
+    sequences = read_sequences_table(
+        input_file,
+        sequence_column,
+        count_column,
+    )
+
+    # Collect sequences by length
+    grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
+    for record in sequences:
+        grouped[len(record.sequence)].append(record)
+    sorted_grouped = dict(sorted(grouped.items()))
+
+    # Write overall stats
+    total_sequences = len(sequences)
+    total_reads = sum(record.count for record in sequences)
+    root.attrs["total_sequences"] = total_sequences
+    root.attrs["total_reads"] = total_reads
+
+    for length, records in sorted_grouped.items():
+        group = root.create_group(f"length_{length}", overwrite=True)
+
+        # Write stats for this length
+        length_reads = sum(r.count for r in records)
+        group.attrs["unique_sequences"] = len(records)
+        group.attrs["total_reads"] = length_reads
+        group.attrs["sequence_length"] = length
+        print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
+
+        # Write sequences and counts as zarr arrays
+        dtype = f"<U{length}"
+        sequences_arr = np.array([r.sequence for r in records], dtype=dtype)
+        counts_arr = np.array([r.count for r in records], dtype=np.int64)
+
+        chunk = min(chunk_size, len(records))
+        group.create_dataset(
+            "sequence",
+            data=sequences_arr,
+            chunks=(chunk,),
+        )
+        group.create_dataset(
+            "count",
+            data=counts_arr,
+            chunks=(chunk,),
+        )
+
+
+def read_sequences_table(
     path: Path,
     sequence_column: str,
     count_column: str,
@@ -242,55 +290,6 @@ def read_sequences_table_with_columns(
     return sequences
 
 
-def split_by_length(
-    sequences: Sequence[UniqueSequence],
-    output_store: Path,
-    chunk_size: int,
-) -> None:
-    """Write per-length tables into a Zarr store with a group per length."""
-    chunk_size = max(1, chunk_size)
-    output_store.parent.mkdir(parents=True, exist_ok=True)
-    root = zarr.open_group(str(output_store), mode="w")
-
-    # Collect sequences by length
-    grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
-    for record in sequences:
-        grouped[len(record.sequence)].append(record)
-    sorted_grouped = dict(sorted(grouped.items()))
-
-    # Write overall stats
-    total_sequences = len(sequences)
-    total_reads = sum(record.count for record in sequences)
-    root.attrs["total_sequences"] = total_sequences
-    root.attrs["total_reads"] = total_reads
-
-    for length, records in sorted_grouped.items():
-        group = root.create_group(f"length_{length}", overwrite=True)
-
-        # Write stats for this length
-        length_reads = sum(r.count for r in records)
-        group.attrs["unique_sequences"] = len(records)
-        group.attrs["total_reads"] = length_reads
-        print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
-
-        # Write sequences and counts as zarr arrays
-        dtype = f"<U{length}"
-        sequences_arr = np.array([r.sequence for r in records], dtype=dtype)
-        counts_arr = np.array([r.count for r in records], dtype=np.int64)
-
-        chunk = min(chunk_size, len(records))
-        group.create_dataset(
-            "sequence",
-            data=sequences_arr,
-            chunks=(chunk,),
-        )
-        group.create_dataset(
-            "count",
-            data=counts_arr,
-            chunks=(chunk,),
-        )
-
-
 def generate_length_pairs(
     lengths: Sequence[int], max_distance: int
 ) -> list[tuple[int, int]]:
@@ -303,6 +302,70 @@ def generate_length_pairs(
                 pairs.append((a, b))
 
     return pairs
+
+
+def load_offsets(length_store: Path) -> dict[int, int]:
+    """Load per-length sequences and map them back to global indices."""
+    store = zarr.open_group(str(length_store), mode="r")
+
+    n_sequences_by_length: dict[int, int] = {}
+    for _, group in store.groups():
+        length = int(group.attrs["sequence_length"])
+        n_sequences = int(group.attrs["unique_sequences"])
+        n_sequences_by_length[length] = n_sequences
+
+    # Compute cumulative offsets
+    offsets_by_length = dict(sorted(n_sequences_by_length.items()))
+    cumulative_offset = 0
+    for length in offsets_by_length:
+        current_count = offsets_by_length[length]
+        offsets_by_length[length] = cumulative_offset
+        cumulative_offset += current_count
+
+    return offsets_by_length, cumulative_offset
+
+
+def load_length_groups(
+    length_store: Path,
+    sequence_to_index: dict[str, int],
+) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]]]:
+    """Load per-length sequences and map them back to global indices."""
+    store = zarr.open_group(str(length_store), mode="r")
+    pattern = re.compile(r"length_(\d+)")
+
+    sequences_by_length: dict[int, list[UniqueSequence]] = {}
+    indices_by_length: dict[int, list[int]] = {}
+
+    for name, group in store.groups():
+        match = pattern.fullmatch(name)
+        if not match:
+            continue
+        length = int(match.group(1))
+        seq_array = group["sequence"][:]
+        count_array = group["count"][:]
+        seq_list = seq_array.tolist()
+        count_list = count_array.tolist()
+
+        sequences_list = [
+            UniqueSequence(sequence=str(seq), count=int(cnt))
+            for seq, cnt in zip(seq_list, count_list, strict=True)
+        ]
+        if not sequences_list:
+            continue
+
+        indices: list[int] = []
+        for seq in seq_list:
+            idx = sequence_to_index.get(seq)
+            if idx is None:
+                raise ValueError(
+                    f"Sequence {seq!r} in group {name!r} not found in unique table."
+                )
+            indices.append(idx)
+
+        sequences_by_length[length] = sequences_list
+        indices_by_length[length] = indices
+
+    return sequences_by_length, indices_by_length
 
 
 def load_length_groups(
@@ -349,26 +412,28 @@ def load_length_groups(
 
 
 def compute_edges_for_pair(
-    sequences_a: Sequence[UniqueSequence],
-    sequences_b: Sequence[UniqueSequence],
+    length_store: Path,
+    length_a: int,
+    length_b: int,
     n_edits: int,
-    same_length: bool,
 ) -> list[tuple[int, int]]:
     """Return local index pairs within edit distance between two length buckets."""
-    if same_length:
-        edges = connect_sequences_same_length(sequences_a, n_edits, 0)
+    if length_a == length_b:
+        edges = connect_sequences_same_length(length_store, length_a, n_edits)
     else:
-        edges = connect_sequences_different_length(sequences_a, sequences_b, n_edits, 0, 0)
+        edges = connect_sequences_different_length(length_store, length_a, length_b, n_edits)
     return list(set(edges))
 
 
 def connect_sequences_same_length(
-    sequences: Sequence[UniqueSequence], n_edits: int, offset: int
+    length_store: Path, length: int, n_edits: int
 ) -> list[tuple[int, int]]:
     """Find all pairs of sequences within an edit distance for same-length sequences."""
-    if not sequences:
-        return []
-    partitions = generate_partitions(len(sequences[0].sequence), n_edits + 1)
+    # Read sequences of the given length
+    sequences = load_length_sequences(length_store, length)
+    partitions = generate_partitions(length, n_edits + 1)
+
+    # Generate buckets and compare within each bucket
     edges: list[tuple[int, int]] = []
     for start, end in partitions:
         seed_to_bucket = fill_buckets(sequences, start, end)
@@ -379,36 +444,31 @@ def connect_sequences_same_length(
             bucket_b = list(bucket)
             compare_buckets(bucket_a, bucket_b, sequences, sequences, n_edits, edges)
 
-    # Adjust indices by offset
-    edges = [(i + offset, j + offset) for i, j in edges]
-
     return edges
 
 
 def connect_sequences_different_length(
-    sequences_a: Sequence[UniqueSequence],
-    sequences_b: Sequence[UniqueSequence],
+    length_store: Path,
+    length_a: int,
+    length_b: int,
     n_edits: int,
-    offset_a: int,
-    offset_b: int,
 ) -> list[tuple[int, int]]:
     """Find all pairs of sequences within an edit distance for different-length sequences."""
-    if not sequences_a or not sequences_b:
-        return []
-    len_a = len(sequences_a[0].sequence)
-    len_b = len(sequences_b[0].sequence)
+    if length_a > length_b:
+        length_a, length_b = length_b, length_a
 
-    if abs(len_a - len_b) > n_edits:
-        return []
-
-    partitions = generate_partitions(len_a, n_edits + 1)
+    # Read sequences of the given lengths
+    sequences_a = load_length_sequences(length_store, length_a)
+    sequences_b = load_length_sequences(length_store, length_b)
+    partitions = generate_partitions(length_a, n_edits + 1)
     edges: list[tuple[int, int]] = []
-    max_shift = min(n_edits, len_b - len_a)
+    max_shift = min(n_edits, length_b - length_a) + 1
 
+    # Generate buckets and compare within each bucket
     for start, end in partitions:
         seed_to_bucket_a = fill_buckets(sequences_a, start, end)
         seed_to_bucket_b: dict[str, list[int]] = {}
-        for shift in range(max_shift + 1):
+        for shift in range(max_shift):
             shifted = fill_buckets(sequences_b, start + shift, end + shift)
             for key, value in shifted.items():
                 seed_to_bucket_b.setdefault(key, []).extend(value)
@@ -421,7 +481,36 @@ def connect_sequences_different_length(
                 list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges
             )
 
-    # Adjust indices by offsets
-    edges = [(i + offset_a, j + offset_b) for i, j in edges]
-
     return edges
+
+
+def load_length_counts(
+    length_store: Path,
+    length: int,
+) -> np.ndarray:
+    """Load counts for a given length from the Zarr store."""
+    return _load_length_group(length_store, length, "count")
+
+
+def load_length_sequences(
+    length_store: Path,
+    length: int,
+) -> np.ndarray:
+    """Load sequences for a given length from the Zarr store."""
+    raw_array = _load_length_group(length_store, length, "sequence")
+    return [str(seq) for seq in raw_array]
+
+
+def _load_length_group(
+    length_store: Path,
+    length: int,
+    data: str
+) -> np.ndarray:
+    """Load sequences or counts for a given length from the Zarr store."""
+    store = zarr.open_group(str(length_store), mode="r")
+    group_name = f"length_{length}"
+    if group_name not in store:
+        raise ValueError(f"Length group {group_name} not found in store {length_store}")
+
+    group = store[group_name]
+    return group[data][:]
