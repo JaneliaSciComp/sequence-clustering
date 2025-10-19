@@ -21,6 +21,22 @@ from .utils import (
     generate_partitions,
 )
 
+
+def run_unique(args) -> None:
+    """Extract unique sequences from a FASTQ file."""
+    start = time.time()
+    fastq_path = Path(args.fastq)
+    output_path = Path(args.output)
+    sequences, total_reads, skipped = collect_unique_sequences(fastq_path)
+    write_sequences_table(sequences, output_path)
+    print(
+        f"Found {len(sequences):,} unique sequences "
+        f"({total_reads:,} total reads, {skipped:,} skipped)."
+    )
+    print(f"Wrote unique sequence table to {output_path}")
+    print(f"Time elapsed: {time.time() - start:.2g} seconds")
+
+
 def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], int, int]:
     """Return unique sequences, total reads, and skipped reads from a FASTQ file."""
     counts: dict[str, int] = defaultdict(int)
@@ -40,272 +56,6 @@ def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], in
         for (seq, count) in ordered
     ]
     return uniques, total_reads, skipped_reads
-
-
-def read_sequences_table_with_columns(
-    path: Path,
-    sequence_column: str,
-    count_column: str,
-) -> list[UniqueSequence]:
-    """Load unique sequences from a delimited file with configurable columns."""
-    sequences: list[UniqueSequence] = []
-
-    with path.open("r", encoding="utf8") as handle:
-        # Detect dialect (in particular, the delimiter)
-        try:
-            header_line = handle.readline()
-            dialect = csv.Sniffer().sniff(header_line)
-        except csv.Error as exc:
-            raise ValueError(f"Unable to detect delimiter in {path}") from exc
-
-        # Set up CSV reader
-        handle.seek(0)
-        reader = csv.DictReader(handle, delimiter=dialect.delimiter)
-        if reader.fieldnames is None:
-            raise ValueError(f"Missing header in {path}")
-
-        # Check if sequence and count columns exist
-        if (
-            sequence_column not in reader.fieldnames
-            or count_column not in reader.fieldnames
-        ):
-            raise ValueError(
-                f"Missing required columns {sequence_column}, {count_column} in {path}; "
-                f"available: {reader.fieldnames}"
-            )
-
-        # Read all (unique) sequences
-        for row in reader:
-            sequence = row[sequence_column].strip()
-            count_str = row[count_column].strip()
-            try:
-                count = int(count_str)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid count value {count_str!r} in {path}"
-                ) from exc
-            sequences.append(UniqueSequence(sequence=sequence, count=count))
-
-    return sequences
-
-
-def split_by_length(
-    sequences: Sequence[UniqueSequence],
-    output_store: Path,
-    chunk_size: int,
-) -> None:
-    """Write per-length tables into a Zarr store with a group per length."""
-    chunk_size = max(1, chunk_size)
-    output_store.parent.mkdir(parents=True, exist_ok=True)
-
-    grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
-    for record in sequences:
-        grouped[len(record.sequence)].append(record)
-
-    sorted_grouped = dict(sorted(grouped.items()))
-    root = zarr.open_group(str(output_store), mode="w")
-
-    total_sequences = len(sequences)
-    total_reads = sum(record.count for record in sequences)
-    root.attrs["total_sequences"] = total_sequences
-    root.attrs["total_reads"] = total_reads
-
-    for length, records in sorted_grouped.items():
-        length_reads = sum(r.count for r in records)
-        print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
-
-        group = root.create_group(f"length_{length}", overwrite=True)
-        group.attrs["unique_sequences"] = len(records)
-        group.attrs["total_reads"] = length_reads
-
-        dtype = f"<U{length}"
-        sequences_arr = np.array([r.sequence for r in records], dtype=dtype)
-        counts_arr = np.array([r.count for r in records], dtype=np.int64)
-
-        chunk = min(chunk_size, len(records))
-        group.create_dataset(
-            "sequence",
-            data=sequences_arr,
-            chunks=(chunk,),
-        )
-        group.create_dataset(
-            "count",
-            data=counts_arr,
-            chunks=(chunk,),
-        )
-
-
-def connect_sequences_same_length(
-    sequences: Sequence[UniqueSequence], n_edits: int, offset: int
-) -> list[tuple[int, int]]:
-    """Find all pairs of sequences within an edit distance for same-length sequences."""
-    if not sequences:
-        return []
-    partitions = generate_partitions(len(sequences[0].sequence), n_edits + 1)
-    edges: list[tuple[int, int]] = []
-    for start, end in partitions:
-        seed_to_bucket = fill_buckets(sequences, start, end)
-        for bucket in seed_to_bucket.values():
-            if len(bucket) < 2:
-                continue
-            bucket_a = list(bucket)
-            bucket_b = list(bucket)
-            compare_buckets(bucket_a, bucket_b, sequences, sequences, n_edits, edges)
-
-    # Adjust indices by offset
-    edges = [(i + offset, j + offset) for i, j in edges]
-
-    return edges
-
-
-def connect_sequences_different_length(
-    sequences_a: Sequence[UniqueSequence],
-    sequences_b: Sequence[UniqueSequence],
-    n_edits: int,
-    offset_a: int,
-    offset_b: int,
-) -> list[tuple[int, int]]:
-    """Find all pairs of sequences within an edit distance for different-length sequences."""
-    if not sequences_a or not sequences_b:
-        return []
-    len_a = len(sequences_a[0].sequence)
-    len_b = len(sequences_b[0].sequence)
-
-    if abs(len_a - len_b) > n_edits:
-        return []
-
-    partitions = generate_partitions(len_a, n_edits + 1)
-    edges: list[tuple[int, int]] = []
-    max_shift = min(n_edits, len_b - len_a)
-
-    for start, end in partitions:
-        seed_to_bucket_a = fill_buckets(sequences_a, start, end)
-        seed_to_bucket_b: dict[str, list[int]] = {}
-        for shift in range(max_shift + 1):
-            shifted = fill_buckets(sequences_b, start + shift, end + shift)
-            for key, value in shifted.items():
-                seed_to_bucket_b.setdefault(key, []).extend(value)
-
-        for seed, bucket_a in seed_to_bucket_a.items():
-            bucket_b = seed_to_bucket_b.get(seed)
-            if not bucket_b:
-                continue
-            compare_buckets(
-                list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges
-            )
-
-    # Adjust indices by offsets
-    edges = [(i + offset_a, j + offset_b) for i, j in edges]
-
-    return edges
-
-
-def run_unique(args) -> None:
-    """Extract unique sequences from a FASTQ file."""
-    start = time.time()
-    fastq_path = Path(args.fastq)
-    output_path = Path(args.output)
-    sequences, total_reads, skipped = collect_unique_sequences(fastq_path)
-    write_sequences_table(sequences, output_path)
-    print(
-        f"Found {len(sequences):,} unique sequences "
-        f"({total_reads:,} total reads, {skipped:,} skipped)."
-    )
-    print(f"Wrote unique sequence table to {output_path}")
-    print(f"Time elapsed: {time.time() - start:.2g} seconds")
-
-
-def run_split(args) -> None:
-    """Split unique sequences into per-length tables."""
-    start = time.time()
-    input_path = Path(args.input)
-    output_store = Path(args.output)
-    sequences = read_sequences_table_with_columns(
-        input_path,
-        sequence_column=args.sequence_column,
-        count_column=args.count_column,
-    )
-    split_by_length(sequences, output_store, args.chunk_size)
-    print(f"Split {len(sequences):,} sequences into Zarr groups under {output_store}")
-    print(f"Time elapsed: {time.time() - start:.2g} seconds")
-
-
-def generate_length_pairs(
-    lengths: Sequence[int], length_to_count: dict[int, int], max_distance: int
-) -> list[tuple[int, int]]:
-    """Return all length pairs (a <= b) within the given distance."""
-    pairs: list[tuple[int, int]] = []
-    lengths = list(sorted(lengths))
-    for i, a in enumerate(lengths):
-        for b in lengths[i:]:
-            if abs(a - b) <= max_distance:
-                pairs.append((a, b))
-
-    # Sort them by the expected number of comparisons (product of counts)
-    pairs.sort(
-        key=lambda ab: length_to_count[ab[0]] * length_to_count[ab[1]],
-        reverse=True
-    )
-    return pairs
-
-
-def load_length_groups(
-    length_store: Path,
-    sequence_to_index: dict[str, int],
-) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]], dict[int, int]]:
-    """Load per-length sequences and map them back to global indices."""
-    store = zarr.open_group(str(length_store), mode="r")
-    pattern = re.compile(r"length_(\d+)")
-
-    sequences_by_length: dict[int, list[UniqueSequence]] = {}
-    indices_by_length: dict[int, list[int]] = {}
-    counts_by_length: dict[int, int] = {}
-
-    for name, group in store.groups():
-        match = pattern.fullmatch(name)
-        if not match:
-            continue
-        length = int(match.group(1))
-        seq_array = group["sequence"][:]
-        count_array = group["count"][:]
-        seq_list = seq_array.tolist()
-        count_list = count_array.tolist()
-
-        sequences_list = [
-            UniqueSequence(sequence=str(seq), count=int(cnt))
-            for seq, cnt in zip(seq_list, count_list, strict=True)
-        ]
-        if not sequences_list:
-            continue
-
-        indices: list[int] = []
-        for seq in seq_list:
-            idx = sequence_to_index.get(seq)
-            if idx is None:
-                raise ValueError(
-                    f"Sequence {seq!r} in group {name!r} not found in unique table."
-                )
-            indices.append(idx)
-
-        sequences_by_length[length] = sequences_list
-        indices_by_length[length] = indices
-        counts_by_length[length] = len(sequences_list)
-
-    return sequences_by_length, indices_by_length, counts_by_length
-
-
-def compute_edges_for_pair(
-    sequences_a: Sequence[UniqueSequence],
-    sequences_b: Sequence[UniqueSequence],
-    n_edits: int,
-    same_length: bool,
-) -> list[tuple[int, int]]:
-    """Return local index pairs within edit distance between two length buckets."""
-    if same_length:
-        edges = connect_sequences_same_length(sequences_a, n_edits, 0)
-    else:
-        edges = connect_sequences_different_length(sequences_a, sequences_b, n_edits, 0, 0)
-    return list(set(edges))
 
 
 def run_cluster(args) -> None:
@@ -448,3 +198,242 @@ def run_cluster(args) -> None:
     )
     print(f"Wrote cluster representatives to {output_path}")
     print(f"Time elapsed: {elapsed:.2g} seconds")
+
+
+def read_sequences_table_with_columns(
+    path: Path,
+    sequence_column: str,
+    count_column: str,
+) -> list[UniqueSequence]:
+    """Load unique sequences from a delimited file with configurable columns."""
+    sequences: list[UniqueSequence] = []
+
+    with path.open("r", encoding="utf8") as handle:
+        # Detect dialect (in particular, the delimiter)
+        try:
+            header_line = handle.readline()
+            dialect = csv.Sniffer().sniff(header_line)
+        except csv.Error as exc:
+            raise ValueError(f"Unable to detect delimiter in {path}") from exc
+
+        # Set up CSV reader
+        handle.seek(0)
+        reader = csv.DictReader(handle, delimiter=dialect.delimiter)
+        if reader.fieldnames is None:
+            raise ValueError(f"Missing header in {path}")
+
+        # Check if sequence and count columns exist
+        if (
+            sequence_column not in reader.fieldnames
+            or count_column not in reader.fieldnames
+        ):
+            raise ValueError(
+                f"Missing required columns {sequence_column}, {count_column} in {path}; "
+                f"available: {reader.fieldnames}"
+            )
+
+        # Read all (unique) sequences
+        for row in reader:
+            sequence = row[sequence_column].strip()
+            count_str = row[count_column].strip()
+            try:
+                count = int(count_str)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid count value {count_str!r} in {path}"
+                ) from exc
+            sequences.append(UniqueSequence(sequence=sequence, count=count))
+
+    return sequences
+
+
+def split_by_length(
+    sequences: Sequence[UniqueSequence],
+    output_store: Path,
+    chunk_size: int,
+) -> None:
+    """Write per-length tables into a Zarr store with a group per length."""
+    chunk_size = max(1, chunk_size)
+    output_store.parent.mkdir(parents=True, exist_ok=True)
+    root = zarr.open_group(str(output_store), mode="w")
+
+    # Collect sequences by length
+    grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
+    for record in sequences:
+        grouped[len(record.sequence)].append(record)
+    sorted_grouped = dict(sorted(grouped.items()))
+
+    # Write overall stats
+    total_sequences = len(sequences)
+    total_reads = sum(record.count for record in sequences)
+    root.attrs["total_sequences"] = total_sequences
+    root.attrs["total_reads"] = total_reads
+
+    for length, records in sorted_grouped.items():
+        group = root.create_group(f"length_{length}", overwrite=True)
+
+        # Write stats for this length
+        length_reads = sum(r.count for r in records)
+        group.attrs["unique_sequences"] = len(records)
+        group.attrs["total_reads"] = length_reads
+        print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
+
+        # Write sequences and counts as zarr arrays
+        dtype = f"<U{length}"
+        sequences_arr = np.array([r.sequence for r in records], dtype=dtype)
+        counts_arr = np.array([r.count for r in records], dtype=np.int64)
+
+        chunk = min(chunk_size, len(records))
+        group.create_dataset(
+            "sequence",
+            data=sequences_arr,
+            chunks=(chunk,),
+        )
+        group.create_dataset(
+            "count",
+            data=counts_arr,
+            chunks=(chunk,),
+        )
+
+
+def generate_length_pairs(
+    lengths: Sequence[int], length_to_count: dict[int, int], max_distance: int
+) -> list[tuple[int, int]]:
+    """Return all length pairs (a <= b) within the given distance."""
+    pairs: list[tuple[int, int]] = []
+    lengths = list(sorted(lengths))
+    for i, a in enumerate(lengths):
+        for b in lengths[i:]:
+            if abs(a - b) <= max_distance:
+                pairs.append((a, b))
+
+    # Sort them by the expected number of comparisons (product of counts)
+    pairs.sort(
+        key=lambda ab: length_to_count[ab[0]] * length_to_count[ab[1]],
+        reverse=True
+    )
+    return pairs
+
+
+def load_length_groups(
+    length_store: Path,
+    sequence_to_index: dict[str, int],
+) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]], dict[int, int]]:
+    """Load per-length sequences and map them back to global indices."""
+    store = zarr.open_group(str(length_store), mode="r")
+    pattern = re.compile(r"length_(\d+)")
+
+    sequences_by_length: dict[int, list[UniqueSequence]] = {}
+    indices_by_length: dict[int, list[int]] = {}
+    counts_by_length: dict[int, int] = {}
+
+    for name, group in store.groups():
+        match = pattern.fullmatch(name)
+        if not match:
+            continue
+        length = int(match.group(1))
+        seq_array = group["sequence"][:]
+        count_array = group["count"][:]
+        seq_list = seq_array.tolist()
+        count_list = count_array.tolist()
+
+        sequences_list = [
+            UniqueSequence(sequence=str(seq), count=int(cnt))
+            for seq, cnt in zip(seq_list, count_list, strict=True)
+        ]
+        if not sequences_list:
+            continue
+
+        indices: list[int] = []
+        for seq in seq_list:
+            idx = sequence_to_index.get(seq)
+            if idx is None:
+                raise ValueError(
+                    f"Sequence {seq!r} in group {name!r} not found in unique table."
+                )
+            indices.append(idx)
+
+        sequences_by_length[length] = sequences_list
+        indices_by_length[length] = indices
+        counts_by_length[length] = len(sequences_list)
+
+    return sequences_by_length, indices_by_length, counts_by_length
+
+
+def compute_edges_for_pair(
+    sequences_a: Sequence[UniqueSequence],
+    sequences_b: Sequence[UniqueSequence],
+    n_edits: int,
+    same_length: bool,
+) -> list[tuple[int, int]]:
+    """Return local index pairs within edit distance between two length buckets."""
+    if same_length:
+        edges = connect_sequences_same_length(sequences_a, n_edits, 0)
+    else:
+        edges = connect_sequences_different_length(sequences_a, sequences_b, n_edits, 0, 0)
+    return list(set(edges))
+
+
+def connect_sequences_same_length(
+    sequences: Sequence[UniqueSequence], n_edits: int, offset: int
+) -> list[tuple[int, int]]:
+    """Find all pairs of sequences within an edit distance for same-length sequences."""
+    if not sequences:
+        return []
+    partitions = generate_partitions(len(sequences[0].sequence), n_edits + 1)
+    edges: list[tuple[int, int]] = []
+    for start, end in partitions:
+        seed_to_bucket = fill_buckets(sequences, start, end)
+        for bucket in seed_to_bucket.values():
+            if len(bucket) < 2:
+                continue
+            bucket_a = list(bucket)
+            bucket_b = list(bucket)
+            compare_buckets(bucket_a, bucket_b, sequences, sequences, n_edits, edges)
+
+    # Adjust indices by offset
+    edges = [(i + offset, j + offset) for i, j in edges]
+
+    return edges
+
+
+def connect_sequences_different_length(
+    sequences_a: Sequence[UniqueSequence],
+    sequences_b: Sequence[UniqueSequence],
+    n_edits: int,
+    offset_a: int,
+    offset_b: int,
+) -> list[tuple[int, int]]:
+    """Find all pairs of sequences within an edit distance for different-length sequences."""
+    if not sequences_a or not sequences_b:
+        return []
+    len_a = len(sequences_a[0].sequence)
+    len_b = len(sequences_b[0].sequence)
+
+    if abs(len_a - len_b) > n_edits:
+        return []
+
+    partitions = generate_partitions(len_a, n_edits + 1)
+    edges: list[tuple[int, int]] = []
+    max_shift = min(n_edits, len_b - len_a)
+
+    for start, end in partitions:
+        seed_to_bucket_a = fill_buckets(sequences_a, start, end)
+        seed_to_bucket_b: dict[str, list[int]] = {}
+        for shift in range(max_shift + 1):
+            shifted = fill_buckets(sequences_b, start + shift, end + shift)
+            for key, value in shifted.items():
+                seed_to_bucket_b.setdefault(key, []).extend(value)
+
+        for seed, bucket_a in seed_to_bucket_a.items():
+            bucket_b = seed_to_bucket_b.get(seed)
+            if not bucket_b:
+                continue
+            compare_buckets(
+                list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges
+            )
+
+    # Adjust indices by offsets
+    edges = [(i + offset_a, j + offset_b) for i, j in edges]
+
+    return edges
