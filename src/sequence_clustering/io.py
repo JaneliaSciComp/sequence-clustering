@@ -100,11 +100,6 @@ def write_sequences_table(
     """Persist unique sequences to a tab-delimited file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="ascii") as handle:
-        # Write a comment line with summary statistics
-        unique_sequences = len(sequences)
-        total_reads = sum(record.count for record in sequences)
-        handle.write(f"# {unique_sequences=}, {total_reads=}\n")
-
         # Write the header
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["sequence", "count"])

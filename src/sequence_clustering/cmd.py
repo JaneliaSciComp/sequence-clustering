@@ -1,12 +1,15 @@
 import concurrent.futures
+import csv
 import subprocess
 import sys
-import csv
 import re
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
+import zarr
 
 from .dsu import DisjointSetUnion
 from .types import UniqueSequence
@@ -16,7 +19,7 @@ from .io import (
     read_edge_file,
     write_edge_file,
     extract_counts,
-    FastQReader
+    FastQReader,
 )
 from .utils import (
     compare_buckets,
@@ -46,24 +49,96 @@ def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], in
     return uniques, total_reads, skipped_reads
 
 
+def read_sequences_table_with_columns(
+    path: Path,
+    sequence_column: str,
+    count_column: str,
+) -> list[UniqueSequence]:
+    """Load unique sequences from a delimited file with configurable columns."""
+    sequences: list[UniqueSequence] = []
+
+    with path.open("r", encoding="utf8") as handle:
+        # Detect dialect (in particular, the delimiter)
+        try:
+            header_line = handle.readline()
+            dialect = csv.Sniffer().sniff(header_line)
+        except csv.Error as exc:
+            raise ValueError(f"Unable to detect delimiter in {path}") from exc
+
+        # Set up CSV reader
+        handle.seek(0)
+        reader = csv.DictReader(handle, delimiter=dialect.delimiter)
+        if reader.fieldnames is None:
+            raise ValueError(f"Missing header in {path}")
+
+        # Check if sequence and count columns exist
+        if (
+            sequence_column not in reader.fieldnames
+            or count_column not in reader.fieldnames
+        ):
+            raise ValueError(
+                f"Missing required columns {sequence_column}, {count_column} in {path}; "
+                f"available: {reader.fieldnames}"
+            )
+
+        # Read all (unique) sequences
+        for row in reader:
+            sequence = row[sequence_column].strip()
+            count_str = row[count_column].strip()
+            try:
+                count = int(count_str)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid count value {count_str!r} in {path}"
+                ) from exc
+            sequences.append(UniqueSequence(sequence=sequence, count=count))
+
+    return sequences
+
+
 def split_by_length(
     sequences: Sequence[UniqueSequence],
-    output_dir: Path,
+    output_store: Path,
+    chunk_size: int,
 ) -> None:
-    """Write per-length tables with summary headers."""
-    # Group sequences by length
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Write per-length tables into a Zarr store with a group per length."""
+    output_store.parent.mkdir(parents=True, exist_ok=True)
+
     grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
     for record in sequences:
         grouped[len(record.sequence)].append(record)
-    grouped = dict(sorted(grouped.items()))
 
-    # Write per-length files
-    for length, records in grouped.items():
+    sorted_grouped = dict(sorted(grouped.items()))
+    root = zarr.open_group(output_store.absolute(), mode="w")
+
+    total_sequences = len(sequences)
+    total_reads = sum(record.count for record in sequences)
+    root.attrs["total_sequences"] = total_sequences
+    root.attrs["total_reads"] = total_reads
+
+    for length, records in sorted_grouped.items():
         length_reads = sum(r.count for r in records)
-        length_path = output_dir / f"length_{length}.csv"
         print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
-        write_sequences_table(records, length_path)
+
+        group = root.create_group(f"length_{length}", overwrite=True)
+        group.attrs["unique_sequences"] = len(records)
+        group.attrs["total_reads"] = length_reads
+
+        dtype = f"<U{length}"
+        sequences_arr = np.array([r.sequence for r in records], dtype=dtype)
+        counts_arr = np.array([r.count for r in records], dtype=np.int64)
+
+        chunk = min(chunk_size, len(records))
+        group.create_dataset(
+            "sequence",
+            data=sequences_arr,
+            chunks=(chunk,),
+        )
+        group.create_dataset(
+            "count",
+            data=counts_arr,
+            chunks=(chunk,),
+        )
 
 
 def connect_sequences_same_length(
@@ -150,12 +225,14 @@ def run_split(args) -> None:
     """Split unique sequences into per-length tables."""
     start = time.time()
     input_path = Path(args.input)
-    output_dir = Path(args.output_dir)
-    sequences = read_sequences_table(input_path)
-    split_by_length(sequences, output_dir)
-    print(
-        f"Split {len(sequences):,} sequences into per-length tables under {output_dir}"
+    output_store = Path(args.output)
+    sequences = read_sequences_table_with_columns(
+        input_path,
+        sequence_column=args.sequence_column,
+        count_column=args.count_column,
     )
+    split_by_length(sequences, output_store, args.chunk_size)
+    print(f"Split {len(sequences):,} sequences into Zarr groups under {output_store}")
     print(f"Time elapsed: {time.time() - start:.2g} seconds")
 
 

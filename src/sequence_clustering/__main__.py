@@ -6,7 +6,7 @@ from .cmd import run_all_pairs, run_cluster, run_pairs, run_split, run_unique
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for the sequence clustering pipeline."""
     parser = argparse.ArgumentParser(
-        description="Modular sequence clustering pipeline",
+        description="Sequence clustering pipeline",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -24,13 +24,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Subcommand: split
     split_parser = subparsers.add_parser(
-        "split", help="Split unique table into per-length CSVs"
+        "split", help="Split input sequences into per-length Zarr groups"
     )
     split_parser.add_argument(
         "--input", "-i", required=True, help="Unique CSV from step 1"
     )
     split_parser.add_argument(
-        "--output-dir", "-o", required=True, help="Directory for per-length CSV files"
+        "--output", "-o", required=True, help="Output Zarr store path"
+    )
+    split_parser.add_argument(
+        "--sequence-column",
+        default="sequence",
+        help="Column name containing sequence strings (default: sequence)",
+    )
+    split_parser.add_argument(
+        "--count-column",
+        default="count",
+        help="Column name containing sequence counts (default: count)",
+    )
+    split_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10000,
+        help="Chunk size to use when writing arrays (default: 10000)",
     )
     split_parser.set_defaults(func=run_split)
 
