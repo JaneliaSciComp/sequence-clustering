@@ -4,7 +4,7 @@ import time
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import zarr
@@ -21,6 +21,14 @@ from .utils import (
     fill_buckets,
     generate_partitions,
 )
+
+
+@dataclass
+class TileSpec:
+    sequence_length: int
+    offset: int
+    start: int
+    end: int
 
 
 def run_unique(args) -> None:
@@ -79,18 +87,16 @@ def run_cluster(args) -> None:
     print(f"Wrote per-length Zarr store to '{length_store}'")
 
     # Generate all sequence pairs to compare
-    length_to_offset, total_count = load_offsets(length_store)
-    pairs = generate_length_pairs(length_to_offset.keys(), n_edits)
+    length_to_total_counts = load_total_counts(length_store)
+    total_count = sum(length_to_total_counts.values())
+    pairs = generate_length_pairs(length_to_total_counts, n_edits, args.tile_size)
     if not pairs:
         print("No length pairs within the requested distance.")
         return
 
     dsu = DisjointSetUnion(total_count)
     n_edges = 0
-
-    client: Client | None = None
-    cluster: LocalCluster | None = None
-    futures = {}
+    futures = []
 
     try:
         # Start a local Dask cluster
@@ -106,33 +112,22 @@ def run_cluster(args) -> None:
             f"and thread distribution {sorted(nthreads.values())}."
         )
 
-        # Submit all length pairs as separate tasks
-        for length_a, length_b in pairs:
+        # Submit all length pairs as separate tasks (in tiles)
+        client.scatter(length_to_total_counts, broadcast=True)
+        for tile_spec_a, tile_spec_b in pairs:
             future = client.submit(
                 compute_edges_for_pair,
                 length_store,
-                length_a,
-                length_b,
+                tile_spec_a,
+                tile_spec_b,
                 n_edits,
             )
-            futures[future] = (length_a, length_b)
+            futures.append(future)
 
         # Collect results as they complete and aggregate edges
-        for future, local_edges in as_completed(futures, with_results=True):
-            length_a, length_b = futures[future]
-
-            offset_a = length_to_offset[length_a]
-            offset_b = length_to_offset[length_b]
-
-            for local_a, local_b in local_edges:
-                global_a = local_a + offset_a
-                global_b = local_b + offset_b
-                dsu.union(global_a, global_b)
-
-            n_edges += len(local_edges)
-            print(
-                f"Length pair ({length_a}, {length_b}) produced {len(local_edges):,} edges."
-            )
+        for future, edges in as_completed(futures, with_results=True):
+            for i, j in edges:
+                dsu.union(i, j)
 
     finally:
         for future in list(futures):
@@ -145,11 +140,12 @@ def run_cluster(args) -> None:
 
     # Load all read counts for cluster assembly
     counts = np.zeros(total_count, dtype=np.int64)
-    for length in length_to_offset:
+    start_idx = 0
+    for length in length_to_total_counts:
         local_counts = load_length_counts(length_store, length)
-        start_idx = length_to_offset[length]
         end_idx = start_idx + len(local_counts)
         counts[start_idx:end_idx] = local_counts
+        start_idx = end_idx
 
     # Assemble clusters from the union-find structure
     components = dsu.get_components()
@@ -296,178 +292,83 @@ def read_sequences_table(
 
 
 def generate_length_pairs(
-    lengths: Sequence[int], max_distance: int
-) -> list[tuple[int, int]]:
-    """Return all length pairs (a <= b) within the given distance."""
-    pairs: list[tuple[int, int]] = []
-    lengths = list(sorted(lengths))
+    lengths_to_total_counts: dict[int, int], max_distance: int, tile_size: int,
+) -> list[tuple[TileSpec, TileSpec]]:
+    """
+    Return all length pairs (a <= b) within the given distance, tiled if
+    there are too many sequences.
+    """
+    pairs: list[tuple[TileSpec, TileSpec]] = []
+    lengths = list(sorted(lengths_to_total_counts.keys()))
+
+    # Compute offsets into the global sequence list by length
+    length_to_offset: dict[int, int] = {}
+    offset = 0
+    for length in lengths:
+        length_to_offset[length] = offset
+        offset += lengths_to_total_counts[length]
+
+    # Generate all length pairs within the given constraints
     for i, a in enumerate(lengths):
         for b in lengths[i:]:
-            if abs(a - b) <= max_distance:
-                pairs.append((a, b))
+            if abs(a - b) > max_distance:
+                continue
+
+            offset_a = length_to_offset[a]
+            offset_b = length_to_offset[b]
+            total_counts_a = lengths_to_total_counts[a]
+            total_counts_b = lengths_to_total_counts[b]
+
+            for i in range(0, total_counts_a, tile_size):
+                tile_spec_i = TileSpec(
+                    sequence_length=a,
+                    offset=offset_a + i,
+                    start=i,
+                    end=min(i + tile_size, total_counts_a),
+                )
+                for j in range(0, total_counts_b, tile_size):
+                    if a == b and i > j:
+                        continue  # Avoid duplicate tiles for same-length pairs
+
+                    tile_spec_j = TileSpec(
+                        sequence_length=b,
+                        offset=offset_b + j,
+                        start=j,
+                        end=min(j + tile_size, total_counts_b),
+                    )
+                    pairs.append((tile_spec_i, tile_spec_j))
 
     return pairs
 
 
-def load_offsets(length_store: Path) -> dict[int, int]:
-    """Load per-length sequences and map them back to global indices."""
+def load_total_counts(length_store: Path) -> dict[int, int]:
+    """Load per-length sequence numbers."""
     store = zarr.open_group(str(length_store), mode="r")
 
-    n_sequences_by_length: dict[int, int] = {}
+    length_to_total_counts: dict[int, int] = {}
     for _, group in store.groups():
         length = int(group.attrs["sequence_length"])
-        n_sequences = int(group.attrs["unique_sequences"])
-        n_sequences_by_length[length] = n_sequences
+        total_counts = int(group.attrs["unique_sequences"])
+        length_to_total_counts[length] = total_counts
 
-    # Compute cumulative offsets
-    offsets_by_length = dict(sorted(n_sequences_by_length.items()))
-    cumulative_offset = 0
-    for length in offsets_by_length:
-        current_count = offsets_by_length[length]
-        offsets_by_length[length] = cumulative_offset
-        cumulative_offset += current_count
-
-    return offsets_by_length, cumulative_offset
-
-
-def load_length_groups(
-    length_store: Path,
-    sequence_to_index: dict[str, int],
-) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]]]:
-    """Load per-length sequences and map them back to global indices."""
-    store = zarr.open_group(str(length_store), mode="r")
-    pattern = re.compile(r"length_(\d+)")
-
-    sequences_by_length: dict[int, list[UniqueSequence]] = {}
-    indices_by_length: dict[int, list[int]] = {}
-
-    for name, group in store.groups():
-        match = pattern.fullmatch(name)
-        if not match:
-            continue
-        length = int(match.group(1))
-        seq_array = group["sequence"][:]
-        count_array = group["count"][:]
-        seq_list = seq_array.tolist()
-        count_list = count_array.tolist()
-
-        sequences_list = [
-            UniqueSequence(sequence=str(seq), count=int(cnt))
-            for seq, cnt in zip(seq_list, count_list, strict=True)
-        ]
-        if not sequences_list:
-            continue
-
-        indices: list[int] = []
-        for seq in seq_list:
-            idx = sequence_to_index.get(seq)
-            if idx is None:
-                raise ValueError(
-                    f"Sequence {seq!r} in group {name!r} not found in unique table."
-                )
-            indices.append(idx)
-
-        sequences_by_length[length] = sequences_list
-        indices_by_length[length] = indices
-
-    return sequences_by_length, indices_by_length
-
-
-def load_length_groups(
-    length_store: Path,
-    sequence_to_index: dict[str, int],
-) -> tuple[dict[int, list[UniqueSequence]], dict[int, list[int]]]:
-    """Load per-length sequences and map them back to global indices."""
-    store = zarr.open_group(str(length_store), mode="r")
-    pattern = re.compile(r"length_(\d+)")
-
-    sequences_by_length: dict[int, list[UniqueSequence]] = {}
-    indices_by_length: dict[int, list[int]] = {}
-
-    for name, group in store.groups():
-        match = pattern.fullmatch(name)
-        if not match:
-            continue
-        length = int(match.group(1))
-        seq_array = group["sequence"][:]
-        count_array = group["count"][:]
-        seq_list = seq_array.tolist()
-        count_list = count_array.tolist()
-
-        sequences_list = [
-            UniqueSequence(sequence=str(seq), count=int(cnt))
-            for seq, cnt in zip(seq_list, count_list, strict=True)
-        ]
-        if not sequences_list:
-            continue
-
-        indices: list[int] = []
-        for seq in seq_list:
-            idx = sequence_to_index.get(seq)
-            if idx is None:
-                raise ValueError(
-                    f"Sequence {seq!r} in group {name!r} not found in unique table."
-                )
-            indices.append(idx)
-
-        sequences_by_length[length] = sequences_list
-        indices_by_length[length] = indices
-
-    return sequences_by_length, indices_by_length
+    return length_to_total_counts
 
 
 def compute_edges_for_pair(
     length_store: Path,
-    length_a: int,
-    length_b: int,
+    tile_spec_a: TileSpec,
+    tile_spec_b: TileSpec,
     n_edits: int,
 ) -> list[tuple[int, int]]:
     """Return local index pairs within edit distance between two length buckets."""
-    if length_a == length_b:
-        edges = connect_sequences_same_length(length_store, length_a, n_edits)
-    else:
-        edges = connect_sequences_different_length(length_store, length_a, length_b, n_edits)
-    return list(set(edges))
-
-
-def connect_sequences_same_length(
-    length_store: Path, length: int, n_edits: int
-) -> list[tuple[int, int]]:
-    """Find all pairs of sequences within an edit distance for same-length sequences."""
-    # Read sequences of the given length
-    sequences = load_length_sequences(length_store, length)
-    partitions = generate_partitions(length, n_edits + 1)
-
-    # Generate buckets and compare within each bucket
-    edges: list[tuple[int, int]] = []
-    for start, end in partitions:
-        seed_to_bucket = fill_buckets(sequences, start, end)
-        for bucket in seed_to_bucket.values():
-            if len(bucket) < 2:
-                continue
-            bucket_a = list(bucket)
-            bucket_b = list(bucket)
-            compare_buckets(bucket_a, bucket_b, sequences, sequences, n_edits, edges)
-
-    return edges
-
-
-def connect_sequences_different_length(
-    length_store: Path,
-    length_a: int,
-    length_b: int,
-    n_edits: int,
-) -> list[tuple[int, int]]:
-    """Find all pairs of sequences within an edit distance for different-length sequences."""
-    if length_a > length_b:
-        length_a, length_b = length_b, length_a
-
     # Read sequences of the given lengths
-    sequences_a = load_length_sequences(length_store, length_a)
-    sequences_b = load_length_sequences(length_store, length_b)
-    partitions = generate_partitions(length_a, n_edits + 1)
+    sequences_a = load_length_sequences(length_store, tile_spec_a.sequence_length)
+    sequences_b = load_length_sequences(length_store, tile_spec_b.sequence_length)
+    sequences_a = sequences_a[tile_spec_a.start:tile_spec_a.end]
+    sequences_b = sequences_b[tile_spec_b.start:tile_spec_b.end]
+    partitions = generate_partitions(tile_spec_a.sequence_length, n_edits + 1)
     edges: list[tuple[int, int]] = []
-    max_shift = min(n_edits, length_b - length_a) + 1
+    max_shift = min(n_edits, tile_spec_b.sequence_length - tile_spec_a.sequence_length) + 1
 
     # Generate buckets and compare within each bucket
     for start, end in partitions:
@@ -483,10 +384,12 @@ def connect_sequences_different_length(
             if not bucket_b:
                 continue
             compare_buckets(
-                list(bucket_a), list(bucket_b), sequences_a, sequences_b, n_edits, edges
+                list(bucket_a), list(bucket_b),
+                sequences_a, sequences_b,
+                n_edits, edges
             )
 
-    return edges
+    return list(set(edges))
 
 
 def load_length_counts(
