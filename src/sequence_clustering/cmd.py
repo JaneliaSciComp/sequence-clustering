@@ -1,7 +1,5 @@
 import csv
-import re
 import time
-import random
 from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass
@@ -14,7 +12,9 @@ from .dsu import DisjointSetUnion
 from .types import UniqueSequence
 from .io import (
     write_sequences_table,
+    read_sequences_table,
     FastQReader,
+    ZarrStoreByLength,
 )
 from .utils import (
     compare_buckets,
@@ -25,6 +25,7 @@ from .utils import (
 
 @dataclass
 class TileSpec:
+    """Specification for a tile of sequences with specific length."""
     sequence_length: int
     offset: int
     start: int
@@ -96,7 +97,9 @@ def run_cluster(args) -> None:
 
     dsu = DisjointSetUnion(total_count)
     n_edges = 0
-    futures = []
+    future_to_tiles: dict = {}
+    cluster: LocalCluster | None = None
+    client: Client | None = None
 
     try:
         # Start a local Dask cluster
@@ -113,7 +116,6 @@ def run_cluster(args) -> None:
         )
 
         # Submit all length pairs as separate tasks (in tiles)
-        client.scatter(length_to_total_counts, broadcast=True)
         for tile_spec_a, tile_spec_b in pairs:
             future = client.submit(
                 compute_edges_for_pair,
@@ -122,44 +124,63 @@ def run_cluster(args) -> None:
                 tile_spec_b,
                 n_edits,
             )
-            futures.append(future)
+            future_to_tiles[future] = (tile_spec_a, tile_spec_b)
 
         # Collect results as they complete and aggregate edges
-        for future, edges in as_completed(futures, with_results=True):
-            for i, j in edges:
-                dsu.union(i, j)
+        for future, edges in as_completed(list(future_to_tiles.keys()), with_results=True):
+            tile_spec_a, tile_spec_b = future_to_tiles.pop(future)
+            offset_a = tile_spec_a.offset
+            offset_b = tile_spec_b.offset
+            for local_i, local_j in edges:
+                global_i = offset_a + local_i
+                global_j = offset_b + local_j
+                dsu.union(global_i, global_j)
+            n_edges += len(edges)
+            future.release()
 
     finally:
-        for future in list(futures):
+        for future in list(future_to_tiles.keys()):
             future.release()
-        futures.clear()
+        future_to_tiles.clear()
         if client is not None:
             client.close()
         if cluster is not None:
             cluster.close()
 
     # Load all read counts for cluster assembly
+    zarr_store = ZarrStoreByLength(length_store)
     counts = np.zeros(total_count, dtype=np.int64)
+    sequences_flat: list[str] = []
     start_idx = 0
-    for length in length_to_total_counts:
-        local_counts = load_length_counts(length_store, length)
+    for length in sorted(length_to_total_counts):
+        local_counts = zarr_store.load_counts(length_store, length)
+        local_sequences = zarr_store.load_sequences(length_store, length)
+        if len(local_counts) != len(local_sequences):
+            raise ValueError(
+                f"Mismatched sequences/counts for length {length} in {length_store}"
+            )
         end_idx = start_idx + len(local_counts)
         counts[start_idx:end_idx] = local_counts
+        sequences_flat.extend(local_sequences)
         start_idx = end_idx
+
+    if start_idx != total_count:
+        raise ValueError(
+            f"Expected {total_count} total sequences but reconstructed {start_idx}"
+        )
 
     # Assemble clusters from the union-find structure
     components = dsu.get_components()
     clusters: list[tuple[int, int, int]] = []
     for component in components:
-        total_count = sum(counts[idx] for idx in component)
+        component_total = sum(counts[idx] for idx in component)
         representative_idx = max(component, key=lambda idx: counts[idx])
-        clusters.append((representative_idx, len(component), total_count))
+        clusters.append((representative_idx, len(component), component_total))
 
     # Dereference representative sequences (and sort by total count)
     del dsu
-    sequences = read_sequences_table(unique_path, args.sequence_column, args.count_column)
     clusters = [
-        (sequences[rep_idx].sequence, cluster_size, total_count)
+        (sequences_flat[rep_idx], cluster_size, total_count)
         for rep_idx, cluster_size, total_count in clusters
     ]
     clusters.sort(key=lambda item: item[2], reverse=True)
@@ -174,7 +195,7 @@ def run_cluster(args) -> None:
 
     elapsed = time.time() - start
     print(
-        f"Processed {len(sequences):,} sequences with {n_edges:,} edges "
+        f"Processed {len(sequences_flat):,} sequences with {n_edges:,} edges "
         f"into {len(clusters):,} clusters."
     )
     print(f"Wrote cluster representatives to {output_path}")
@@ -189,10 +210,6 @@ def split_by_length(
     count_column: str,
 ) -> None:
     """Write per-length tables into a Zarr store with a group per length."""
-    chunk_size = max(1, chunk_size)
-    output_store.parent.mkdir(parents=True, exist_ok=True)
-    root = zarr.open_group(str(output_store), mode="w")
-
     # Read all sequences from the input csv file
     sequences = read_sequences_table(
         input_file,
@@ -200,95 +217,8 @@ def split_by_length(
         count_column,
     )
 
-    # Collect sequences by length
-    grouped: dict[int, list[UniqueSequence]] = defaultdict(list)
-    for record in sequences:
-        grouped[len(record.sequence)].append(record)
-    sorted_grouped = dict(sorted(grouped.items()))
-
-    # Write overall stats
-    total_sequences = len(sequences)
-    total_reads = sum(record.count for record in sequences)
-    root.attrs["total_sequences"] = total_sequences
-    root.attrs["total_reads"] = total_reads
-
-    for length, records in sorted_grouped.items():
-        group = root.create_group(f"length_{length}", overwrite=True)
-
-        # Randomize order to avoid similarity clusters
-        # (-> better load balancing in pairwise comparisons later)
-        random.shuffle(records)
-
-        # Write stats for this length
-        length_reads = sum(r.count for r in records)
-        group.attrs["unique_sequences"] = len(records)
-        group.attrs["total_reads"] = length_reads
-        group.attrs["sequence_length"] = length
-        print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
-
-        # Write sequences and counts as zarr arrays
-        str_type = f"<U{length}"
-        sequences_arr = np.array([r.sequence for r in records], dtype=str_type)
-        counts_arr = np.array([r.count for r in records], dtype=np.int64)
-
-        chunk = min(chunk_size, len(records))
-        group.create_dataset(
-            "sequence",
-            data=sequences_arr,
-            chunks=(chunk,),
-        )
-        group.create_dataset(
-            "count",
-            data=counts_arr,
-            chunks=(chunk,),
-        )
-
-
-def read_sequences_table(
-    path: Path,
-    sequence_column: str,
-    count_column: str,
-) -> list[UniqueSequence]:
-    """Load unique sequences from a delimited file with configurable columns."""
-    sequences: list[UniqueSequence] = []
-
-    with path.open("r", encoding="utf8") as handle:
-        # Detect dialect (in particular, the delimiter)
-        try:
-            header_line = handle.readline()
-            dialect = csv.Sniffer().sniff(header_line)
-        except csv.Error as exc:
-            raise ValueError(f"Unable to detect delimiter in {path}") from exc
-
-        # Set up CSV reader
-        handle.seek(0)
-        reader = csv.DictReader(handle, delimiter=dialect.delimiter)
-        if reader.fieldnames is None:
-            raise ValueError(f"Missing header in {path}")
-
-        # Check if sequence and count columns exist
-        if (
-            sequence_column not in reader.fieldnames
-            or count_column not in reader.fieldnames
-        ):
-            raise ValueError(
-                f"Missing required columns {sequence_column}, {count_column} in {path}; "
-                f"available: {reader.fieldnames}"
-            )
-
-        # Read all (unique) sequences
-        for row in reader:
-            sequence = row[sequence_column].strip()
-            count_str = row[count_column].strip()
-            try:
-                count = int(count_str)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid count value {count_str!r} in {path}"
-                ) from exc
-            sequences.append(UniqueSequence(sequence=sequence, count=count))
-
-    return sequences
+    # Write sequences to Zarr store by length
+    ZarrStoreByLength.write(sequences, output_store, chunk_size)
 
 
 def generate_length_pairs(
@@ -362,10 +292,15 @@ def compute_edges_for_pair(
 ) -> list[tuple[int, int]]:
     """Return local index pairs within edit distance between two length buckets."""
     # Read sequences of the given lengths
-    sequences_a = load_length_sequences(length_store, tile_spec_a.sequence_length)
-    sequences_b = load_length_sequences(length_store, tile_spec_b.sequence_length)
-    sequences_a = sequences_a[tile_spec_a.start:tile_spec_a.end]
-    sequences_b = sequences_b[tile_spec_b.start:tile_spec_b.end]
+    zarr_store = ZarrStoreByLength(length_store)
+    sequences_a = zarr_store.load_sequences(
+        tile_spec_a.sequence_length,
+        slice(tile_spec_a.start, tile_spec_a.end)
+    )
+    sequences_b = zarr_store.load_sequences(
+        tile_spec_b.sequence_length,
+        slice(tile_spec_b.start, tile_spec_b.end)
+    )
     partitions = generate_partitions(tile_spec_a.sequence_length, n_edits + 1)
     edges: list[tuple[int, int]] = []
     max_shift = min(n_edits, tile_spec_b.sequence_length - tile_spec_a.sequence_length) + 1
@@ -394,35 +329,3 @@ def compute_edges_for_pair(
     edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
 
     return edges
-
-
-def load_length_counts(
-    length_store: Path,
-    length: int,
-) -> np.ndarray:
-    """Load counts for a given length from the Zarr store."""
-    return _load_length_group(length_store, length, "count")
-
-
-def load_length_sequences(
-    length_store: Path,
-    length: int,
-) -> np.ndarray:
-    """Load sequences for a given length from the Zarr store."""
-    raw_array = _load_length_group(length_store, length, "sequence")
-    return [str(seq) for seq in raw_array]
-
-
-def _load_length_group(
-    length_store: Path,
-    length: int,
-    data: str
-) -> np.ndarray:
-    """Load sequences or counts for a given length from the Zarr store."""
-    store = zarr.open_group(str(length_store), mode="r")
-    group_name = f"length_{length}"
-    if group_name not in store:
-        raise ValueError(f"Length group {group_name} not found in store {length_store}")
-
-    group = store[group_name]
-    return group[data][:]
