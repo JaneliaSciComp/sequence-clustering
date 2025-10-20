@@ -299,26 +299,34 @@ def compute_edges_for_pair(
     max_shift = min(n_edits, tile_spec_b.sequence_length - tile_spec_a.sequence_length) + 1
 
     # Generate buckets and compare within each bucket
+    total_buckets = 0
+    start_time = time.time()
     for start, end in partitions:
         seed_to_bucket_a = fill_buckets(sequences_a, start, end)
-        seed_to_bucket_b: dict[str, list[int]] = {}
+        seed_to_bucket_b: dict[str, list[int]] = defaultdict(list)
         for shift in range(max_shift):
             shifted = fill_buckets(sequences_b, start + shift, end + shift)
             for key, value in shifted.items():
-                seed_to_bucket_b.setdefault(key, []).extend(value)
+                seed_to_bucket_b[key].extend(value)
 
         for seed, bucket_a in seed_to_bucket_a.items():
             bucket_b = seed_to_bucket_b.get(seed)
             if not bucket_b:
                 continue
+            total_buckets += len(bucket_a) * len(bucket_b)
             compare_buckets(
-                list(bucket_a), list(bucket_b),
+                bucket_a, bucket_b,
                 sequences_a, sequences_b,
                 n_edits, edges
             )
 
-    # Remove duplicate edges and apply offset
-    edges = list(set(edges))
-    edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
+    total_pairwise = len(sequences_a) * len(sequences_b)
+    elapsed = time.time() - start_time
+    print(
+        f"Computed {len(edges):,} edges "
+        f"(performed {total_buckets:,} of {total_pairwise:,} comparisons) between lengths "
+        f"{tile_spec_a.sequence_length} and {tile_spec_b.sequence_length} in {elapsed:.2f} seconds."
+    )
 
-    return edges
+    # Remove duplicate edges and apply offset
+    return [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in set(edges)]

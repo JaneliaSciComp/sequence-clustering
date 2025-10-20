@@ -137,6 +137,8 @@ def compare_buckets(
     cdef int distance
     
     while bucket_a:
+        # Pop an index from bucket_a to avoid redundant comparisons if
+        # both buckets are the same
         i = bucket_a.pop()
         seq_i = sequences_a[i]
 

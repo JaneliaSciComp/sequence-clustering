@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_parser.add_argument(
         "--tile-size",
         type=int,
-        default=10000,
+        default=100000,
         help="Tile size to do pairwise comparisons on (default: 10000)",
     )
     cluster_parser.add_argument(
@@ -73,8 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_parser.add_argument(
         "--threads-per-worker",
         type=int,
-        default=0,
-        help="Threads per Dask worker (default: auto)",
+        default=1,
+        help="Threads per Dask worker (default: 1)",
     )
     cluster_parser.set_defaults(func=run_cluster)
 
