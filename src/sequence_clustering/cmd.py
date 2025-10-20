@@ -1,6 +1,7 @@
 import csv
 import re
 import time
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -218,6 +219,10 @@ def split_by_length(
     for length, records in sorted_grouped.items():
         group = root.create_group(f"length_{length}", overwrite=True)
 
+        # Randomize order to avoid similarity clusters
+        # (-> better load balancing in pairwise comparisons later)
+        random.shuffle(records)
+
         # Write stats for this length
         length_reads = sum(r.count for r in records)
         group.attrs["unique_sequences"] = len(records)
@@ -226,8 +231,8 @@ def split_by_length(
         print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
 
         # Write sequences and counts as zarr arrays
-        dtype = f"<U{length}"
-        sequences_arr = np.array([r.sequence for r in records], dtype=dtype)
+        str_type = f"<U{length}"
+        sequences_arr = np.array([r.sequence for r in records], dtype=str_type)
         counts_arr = np.array([r.count for r in records], dtype=np.int64)
 
         chunk = min(chunk_size, len(records))
