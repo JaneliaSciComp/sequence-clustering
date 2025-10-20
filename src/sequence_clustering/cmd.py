@@ -389,7 +389,11 @@ def compute_edges_for_pair(
                 n_edits, edges
             )
 
-    return list(set(edges))
+    # Remove duplicate edges and apply offset
+    edges = list(set(edges))
+    edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
+
+    return edges
 
 
 def load_length_counts(
