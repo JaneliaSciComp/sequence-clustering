@@ -81,3 +81,40 @@ cdef class DisjointSetUnion:
             r = self._find(i)
             components[r].append(i)
         return list(components.values())
+
+    @staticmethod
+    def deduplicate_edges(edges):
+        """Remove duplicate edges while preserving component connectivity."""
+        if not edges:
+            return []
+
+        cdef dict node_to_index = {}
+        cdef list unique_nodes = []
+        next_index = 0
+
+        # Assign compact indices to each node encountered in the edges
+        for edge in edges:
+            for node in edge:
+                if node not in node_to_index:
+                    node_to_index[node] = next_index
+                    unique_nodes.append(node)
+                    next_index += 1
+
+        # Construct connected components using DSU
+        dsu = DisjointSetUnion(next_index)
+        for u, v in edges:
+            dsu._union(node_to_index[u], node_to_index[v])
+        components = dsu.get_components()
+
+        # Reconstruct deduplicated edges from components
+        deduplicated_edges = []
+        for component in components:
+            if len(component) < 2:
+                continue
+            start = unique_nodes[component[0]]
+            for i in range(1, len(component)):
+                end = unique_nodes[component[i]]
+                deduplicated_edges.append((start, end))
+                start = end
+
+        return deduplicated_edges
