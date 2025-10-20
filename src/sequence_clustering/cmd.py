@@ -97,9 +97,6 @@ def run_cluster(args) -> None:
 
     dsu = DisjointSetUnion(total_count)
     n_edges = 0
-    future_to_tiles: dict = {}
-    cluster: LocalCluster | None = None
-    client: Client | None = None
 
     try:
         # Start a local Dask cluster
@@ -116,28 +113,28 @@ def run_cluster(args) -> None:
         )
 
         # Submit all length pairs as separate tasks (in tiles)
-        for tile_spec_a, tile_spec_b in pairs:
-            future = client.submit(
+        futures = [
+            client.submit(
                 compute_edges_for_pair,
                 length_store,
                 tile_spec_a,
                 tile_spec_b,
                 n_edits,
             )
-            future_to_tiles[future] = (tile_spec_a, tile_spec_b)
+            for tile_spec_a, tile_spec_b in pairs
+        ]
 
         # Collect results as they complete and aggregate edges
-        for future, edges in as_completed(list(future_to_tiles.keys()), with_results=True):
-            future_to_tiles.pop(future, None)
+        for future, edges in as_completed(futures, with_results=True):
             for global_i, global_j in edges:
                 dsu.union(global_i, global_j)
             n_edges += len(edges)
             future.release()
 
     finally:
-        for future in list(future_to_tiles.keys()):
+        for future in futures:
             future.release()
-        future_to_tiles.clear()
+        futures.clear()
         if client is not None:
             client.close()
         if cluster is not None:
