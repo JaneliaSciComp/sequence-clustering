@@ -128,12 +128,8 @@ def run_cluster(args) -> None:
 
         # Collect results as they complete and aggregate edges
         for future, edges in as_completed(list(future_to_tiles.keys()), with_results=True):
-            tile_spec_a, tile_spec_b = future_to_tiles.pop(future)
-            offset_a = tile_spec_a.offset
-            offset_b = tile_spec_b.offset
-            for local_i, local_j in edges:
-                global_i = offset_a + local_i
-                global_j = offset_b + local_j
+            future_to_tiles.pop(future, None)
+            for global_i, global_j in edges:
                 dsu.union(global_i, global_j)
             n_edges += len(edges)
             future.release()
@@ -153,8 +149,8 @@ def run_cluster(args) -> None:
     sequences_flat: list[str] = []
     start_idx = 0
     for length in sorted(length_to_total_counts):
-        local_counts = zarr_store.load_counts(length_store, length)
-        local_sequences = zarr_store.load_sequences(length_store, length)
+        local_counts = zarr_store.load_counts(length)
+        local_sequences = zarr_store.load_sequences(length)
         if len(local_counts) != len(local_sequences):
             raise ValueError(
                 f"Mismatched sequences/counts for length {length} in {length_store}"
