@@ -322,11 +322,39 @@ def compute_edges_for_pair(
 
     total_pairwise = len(sequences_a) * len(sequences_b)
     elapsed = time.time() - start_time
+
+    # Remove duplicate edges and apply offset
+    edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
+    edges = deduplicate_edges(edges)
     print(
         f"Computed {len(edges):,} edges "
         f"(performed {total_buckets:,} of {total_pairwise:,} comparisons) between lengths "
         f"{tile_spec_a.sequence_length} and {tile_spec_b.sequence_length} in {elapsed:.2f} seconds."
     )
+    return edges
 
-    # Remove duplicate edges and apply offset
-    return [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in set(edges)]
+
+def deduplicate_edges(edges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Remove duplicate edges from the list."""
+    # Find unique nodes
+    edges = np.array(edges, dtype=np.int64)
+    unique_nodes, inverse = np.unique(edges.flatten(), return_inverse=True)
+
+    # Map original edges to indices in the unique node list
+    normalized_edges = inverse.reshape(-1, 2)
+
+    # Find clusters
+    dsu = DisjointSetUnion(len(unique_nodes))
+    for edge in normalized_edges:
+        a, b = edge
+        dsu.union(a, b)
+
+    edges = []
+    for component in dsu.get_components():
+        start = unique_nodes[component[0]]
+        for i in range(1, len(component)):
+            end = unique_nodes[component[i]]
+            edges.append((start, end))
+            start = end
+
+    return edges
