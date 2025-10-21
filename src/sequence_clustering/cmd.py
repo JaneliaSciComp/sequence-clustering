@@ -82,7 +82,7 @@ def run_cluster(args) -> None:
     split_by_length(
         unique_path,
         length_store,
-        chunk_size=args.chunk_size,
+        chunk_size=args.tile_size,
         sequence_column=args.sequence_column,
         count_column=args.count_column,
     )
