@@ -260,7 +260,7 @@ def create_dask_cluster(args):
             n_workers=args.workers,
             cores=args.threads_per_worker,
             log_directory="dask-logs",
-            memory="1GB",  # dummy value; ignored by the scheduler
+            memory=f"{15 * args.threads_per_worker}GB",  # ignored by scheduler, but not by nanny
             walltime="24:00",  # set a reasonable walltime
             job_script_prologue=["export PYTHONUNBUFFERED=1"],  # unbuffer Python stdio
         )
