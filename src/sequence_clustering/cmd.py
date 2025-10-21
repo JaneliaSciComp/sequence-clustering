@@ -261,6 +261,7 @@ def create_dask_cluster(args):
             cores=args.threads_per_worker,
             log_directory="dask-logs",
             memory="1GB",  # dummy value; ignored by the scheduler
+            walltime="24:00",  # set a reasonable walltime
             job_script_prologue=["export PYTHONUNBUFFERED=1"],  # unbuffer Python stdio
         )
         print(f"Started LSF Dask cluster with {args.workers} workers.")
