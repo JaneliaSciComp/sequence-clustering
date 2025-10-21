@@ -76,6 +76,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Threads per Dask worker (default: 1)",
     )
+    cluster_parser.add_argument(
+        "--parallel",
+        choices=("local", "lsf"),
+        type=str,
+        default="local",
+        help="Parallelism strategy (choices: local, lsf; default: local)",
+    )
     cluster_parser.set_defaults(func=run_cluster)
 
     return parser

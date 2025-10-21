@@ -6,7 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import zarr
-from dask.distributed import Client, LocalCluster, as_completed
+from dask.distributed import Client, as_completed, LocalCluster
+from dask_jobqueue import LSFCluster
 
 from .dsu import DisjointSetUnion
 from .types import UniqueSequence
@@ -98,20 +99,8 @@ def run_cluster(args) -> None:
     dsu = DisjointSetUnion(total_count)
     n_edges = 0
 
-    try:
-        # Start a local Dask cluster
-        cluster = LocalCluster(
-            n_workers=args.workers or None,
-            threads_per_worker=args.threads_per_worker or None,
-            dashboard_address=None,
-        )
-        client = Client(cluster)
-        nthreads = client.nthreads()
-        print(
-            f"Started local Dask cluster with {len(nthreads)} workers "
-            f"and thread distribution {sorted(nthreads.values())}."
-        )
-
+    # Start a local Dask cluster to process all length pairs
+    with create_dask_cluster(args) as dask_cluster, Client(dask_cluster) as client:
         # Submit all length pairs as separate tasks (in tiles)
         futures = [
             client.submit(
@@ -130,15 +119,6 @@ def run_cluster(args) -> None:
                 dsu.union(global_i, global_j)
             n_edges += len(edges)
             future.release()
-
-    finally:
-        for future in futures:
-            future.release()
-        futures.clear()
-        if client is not None:
-            client.close()
-        if cluster is not None:
-            cluster.close()
 
     # Load all read counts for cluster assembly
     zarr_store = ZarrStoreByLength(length_store)
@@ -262,6 +242,29 @@ def generate_length_pairs(
                     pairs.append((tile_spec_i, tile_spec_j))
 
     return pairs
+
+
+def create_dask_cluster(args):
+    """Create a Dask cluster based on the specified parallelism strategy."""
+    if args.parallel == "local":
+        cluster = LocalCluster(
+            n_workers=args.workers,
+            threads_per_worker=args.threads_per_worker,
+        )
+        print(f"Started local Dask cluster with {args.workers} workers.")
+        return cluster
+    elif args.parallel == "lsf":
+        cluster = LSFCluster(
+            queue="local",
+            project="das",
+            n_workers=args.workers,
+            cores=args.threads_per_worker,
+            log_directory="dask-logs",
+        )
+        print(f"Started LSF Dask cluster with {args.workers} workers.")
+        return cluster
+    else:
+        raise ValueError(f"Unknown parallelism strategy: {args.parallel}")
 
 
 def load_total_counts(length_store: Path) -> dict[int, int]:
