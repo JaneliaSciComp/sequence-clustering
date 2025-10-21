@@ -1,5 +1,7 @@
 import csv
 import random
+import sys
+import logging
 from typing import Any, Sequence
 from pathlib import Path
 from collections import defaultdict
@@ -9,6 +11,21 @@ import numpy as np
 
 from .utils import is_valid_sequence
 from .types import UniqueSequence
+
+
+# Set up logging
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s: %(message)s",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(handler)
+    logger.propagate = False
 
 
 class FastQReader:
@@ -139,7 +156,12 @@ class ZarrStoreByLength:
             group.attrs["unique_sequences"] = len(records)
             group.attrs["total_reads"] = length_reads
             group.attrs["sequence_length"] = length
-            print(f"Length {length}: {len(records):,} sequences, {length_reads:,} reads")
+            logger.info(
+                "Length %d: %s sequences, %s reads",
+                length,
+                format(len(records), ","),
+                format(length_reads, ","),
+            )
 
             # Write sequences and counts as zarr arrays
             str_type = f"<U{length}"

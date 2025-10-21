@@ -1,5 +1,7 @@
 import csv
 import time
+import sys
+import logging
 from collections import defaultdict
 from pathlib import Path
 from dataclasses import dataclass
@@ -24,6 +26,21 @@ from .utils import (
 )
 
 
+# Set up logging
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s: %(message)s",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
 @dataclass
 class TileSpec:
     """Specification for a tile of sequences with specific length."""
@@ -40,12 +57,14 @@ def run_unique(args) -> None:
     output_path = Path(args.output)
     sequences, total_reads, skipped = collect_unique_sequences(fastq_path)
     write_sequences_table(sequences, output_path)
-    print(
-        f"Found {len(sequences):,} unique sequences "
-        f"({total_reads:,} total reads, {skipped:,} skipped)."
+    logger.info(
+        "Found %d unique sequences (%d total reads, %d skipped).",
+        len(sequences),
+        total_reads,
+        skipped,
     )
-    print(f"Wrote unique sequence table to {output_path}")
-    print(f"Time elapsed: {time.time() - start:.2g} seconds")
+    logger.info("Wrote unique sequence table to %s", output_path)
+    logger.info("Time elapsed: %.2g seconds", time.time() - start)
 
 
 def collect_unique_sequences(fastq_path: Path) -> tuple[list[UniqueSequence], int, int]:
@@ -78,7 +97,7 @@ def run_cluster(args) -> None:
     n_edits = args.distance
 
     # Split sequences by length to make accessing them easier
-    print(f"Loading unique sequences from '{unique_path}'...")
+    logger.info("Loading unique sequences from %s...", unique_path)
     split_by_length(
         unique_path,
         length_store,
@@ -86,14 +105,14 @@ def run_cluster(args) -> None:
         sequence_column=args.sequence_column,
         count_column=args.count_column,
     )
-    print(f"Wrote per-length Zarr store to '{length_store}'")
+    logger.info("Wrote per-length Zarr store to %s", length_store)
 
     # Generate all sequence pairs to compare
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
     pairs = generate_length_pairs(length_to_total_counts, n_edits, args.tile_size)
     if not pairs:
-        print("No length pairs within the requested distance.")
+        logger.info("No length pairs within the requested distance.")
         return
 
     dsu = DisjointSetUnion(total_count)
@@ -115,8 +134,7 @@ def run_cluster(args) -> None:
 
         # Collect results as they complete and aggregate edges
         for i, (future, edges) in enumerate(as_completed(futures, with_results=True)):
-            time_stamp = time.strftime("%H:%M:%S", time.localtime())
-            print(f"[{time_stamp}] Finished task {i + 1} / {len(futures)}")
+            logger.info("Finished task %d / %d", i + 1, len(futures))
             for global_i, global_j in edges:
                 dsu.union(global_i, global_j)
             n_edges += len(edges)
@@ -169,12 +187,11 @@ def run_cluster(args) -> None:
             writer.writerow([representative, str(cluster_size), str(total_count)])
 
     elapsed = time.time() - start
-    print(
-        f"Processed {len(sequences_flat):,} sequences with {n_edges:,} edges "
-        f"into {len(clusters):,} clusters."
+    logger.info("Processed %d sequences with %d edges into %d clusters.",
+        len(sequences_flat), n_edges, len(clusters)
     )
-    print(f"Wrote cluster representatives to {output_path}")
-    print(f"Time elapsed: {elapsed:.2g} seconds")
+    logger.info("Wrote cluster representatives to %s", output_path)
+    logger.info("Time elapsed: %.2g seconds", elapsed)
 
 
 def split_by_length(
@@ -253,7 +270,7 @@ def create_dask_cluster(args):
             n_workers=args.workers,
             threads_per_worker=args.threads_per_worker,
         )
-        print(f"Started local Dask cluster with {args.workers} workers.")
+        logger.info("Started local Dask cluster with %d workers.", args.workers)
         return cluster
     elif args.parallel == "lsf":
         cluster = LSFCluster(
@@ -266,7 +283,7 @@ def create_dask_cluster(args):
             walltime="24:00",  # set a reasonable walltime
             job_script_prologue=["export PYTHONUNBUFFERED=1"],  # unbuffer Python stdio
         )
-        print(f"Started LSF Dask cluster with {args.workers} workers.")
+        logger.info("Started LSF Dask cluster with %d workers.", args.workers)
         return cluster
     else:
         raise ValueError(f"Unknown parallelism strategy: {args.parallel}")
@@ -334,9 +351,13 @@ def compute_edges_for_pair(
     # Remove duplicate edges and apply offset
     edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
     edges = DisjointSetUnion.deduplicate_edges(edges)
-    print(
-        f"Lengths {tile_spec_a.sequence_length} and {tile_spec_b.sequence_length}: "
-        f"Found {len(edges):,} edges (performed {total_buckets:,} of {total_pairwise:,} "
-        f"comparisons) in {elapsed:.2f} seconds."
+    logger.info(
+        "Lengths %d and %d: Found %d edges (performed %d of %d comparisons) in %.2f seconds.",
+        tile_spec_a.sequence_length,
+        tile_spec_b.sequence_length,
+        len(edges),
+        total_buckets,
+        total_pairwise,
+        elapsed,
     )
     return edges
