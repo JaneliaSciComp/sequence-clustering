@@ -114,7 +114,9 @@ def run_cluster(args) -> None:
         ]
 
         # Collect results as they complete and aggregate edges
-        for future, edges in as_completed(futures, with_results=True):
+        for i, (future, edges) in enumerate(as_completed(futures, with_results=True)):
+            time_stamp = time.strftime("%H:%M:%S", time.localtime())
+            print(f"[{time_stamp}] Finished task {i + 1} / {len(futures)}")
             for global_i, global_j in edges:
                 dsu.union(global_i, global_j)
             n_edges += len(edges)
