@@ -114,7 +114,7 @@ def run_cluster(args) -> None:
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
     tile_size = total_count // math.sqrt(30 * args.workers) + 1
-    tile_size = 1000 * ((tile_size + 999) // 1000)  # round up to nearest 1000
+    tile_size = int(1000 * ((tile_size + 999) // 1000))  # round up to nearest 1000
     logger.info("Using tile size of %d for %d total sequences.", tile_size, total_count)
     pairs = generate_length_pairs(length_to_total_counts, n_edits, tile_size)
     logger.info("Generated %d length pairs to process.", len(pairs))
