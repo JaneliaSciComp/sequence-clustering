@@ -92,7 +92,11 @@ def run_cluster(args) -> None:
     """Build clusters by computing edges with Dask and unioning them locally."""
     start = time.time()
     unique_path = Path(args.input)
-    length_store = Path(args.length_store) or unique_path.parent / "by_length.zarr"
+    length_store = (
+        Path(args.length_store)
+        if args.length_store
+        else unique_path.parent / "by_length.zarr"
+    )
     output_path = Path(args.output)
     n_edits = args.distance
 
@@ -115,6 +119,12 @@ def run_cluster(args) -> None:
         logger.info("No length pairs within the requested distance.")
         return
 
+    # Summarize some tiles to only have ~10 * workers tasks
+    pair_groups = []
+    chunk_size = max(1, len(pairs) // (10 * args.workers))
+    for i in range(0, len(pairs), chunk_size):
+        pair_groups.append(pairs[i:i + chunk_size])
+
     dsu = DisjointSetUnion(total_count)
     n_edges = 0
 
@@ -123,13 +133,12 @@ def run_cluster(args) -> None:
         # Submit all length pairs as separate tasks (in tiles)
         futures = [
             client.submit(
-                compute_edges_for_pair,
+                compute_edges_for_all_pairs,
                 length_store,
-                tile_spec_a,
-                tile_spec_b,
+                pairs,
                 n_edits,
             )
-            for tile_spec_a, tile_spec_b in pairs
+            for pairs in pair_groups
         ]
 
         # Collect results as they complete and aggregate edges
@@ -302,6 +311,30 @@ def load_total_counts(length_store: Path) -> dict[int, int]:
     return length_to_total_counts
 
 
+def compute_edges_for_all_pairs(
+    length_store: Path,
+    pairs: list[tuple[TileSpec, TileSpec]],
+    n_edits: int,
+) -> list[tuple[int, int]]:
+    """Return all edges within edit distance for the given length tile pairs."""
+    all_edges: list[tuple[int, int]] = []
+    for tile_spec_a, tile_spec_b in pairs:
+        edges = compute_edges_for_pair(
+            length_store,
+            tile_spec_a,
+            tile_spec_b,
+            n_edits,
+        )
+        edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
+        all_edges.extend(edges)
+
+    # Remove duplicate edges and apply offset
+    old_edges_count = len(all_edges)
+    all_edges = DisjointSetUnion.deduplicate_edges(all_edges)
+    logger.info("Deduplicated %d edges to %d edges.", old_edges_count, len(all_edges))
+
+    return all_edges
+
 def compute_edges_for_pair(
     length_store: Path,
     tile_spec_a: TileSpec,
@@ -347,10 +380,6 @@ def compute_edges_for_pair(
 
     total_pairwise = len(sequences_a) * len(sequences_b)
     elapsed = time.time() - start_time
-
-    # Remove duplicate edges and apply offset
-    edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
-    edges = DisjointSetUnion.deduplicate_edges(edges)
     logger.info(
         "Lengths %d and %d: Found %d edges (performed %s of %s comparisons) in %.2f seconds.",
         tile_spec_a.sequence_length,
@@ -360,4 +389,5 @@ def compute_edges_for_pair(
         format(total_pairwise, ","),
         elapsed,
     )
+
     return edges
