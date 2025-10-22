@@ -41,6 +41,7 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.propagate = False
 
+MICRO_TILE = 10000
 
 @dataclass
 class TileSpec:
@@ -105,16 +106,16 @@ def run_cluster(args) -> None:
     split_by_length(
         unique_path,
         length_store,
-        chunk_size=1000,
+        chunk_size=MICRO_TILE,
         sequence_column=args.sequence_column,
         count_column=args.count_column,
     )
 
-    # Generate all sequence pairs to compare
+    # Generate all sequence pairs to compare (round up to nearest MICRO_TILE)
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
     tile_size = total_count // math.sqrt(30 * args.workers) + 1
-    tile_size = int(1000 * ((tile_size + 999) // 1000))  # round up to nearest 1000
+    tile_size = int(MICRO_TILE * ((tile_size + MICRO_TILE - 1) // MICRO_TILE))
     logger.info("Using tile size of %d for %d total sequences.", tile_size, total_count)
     pairs = generate_length_pairs(length_to_total_counts, n_edits, tile_size)
     logger.info("Generated %d length pairs to process.", len(pairs))
@@ -339,16 +340,16 @@ def compute_edges_for_pair(
     partitions = generate_partitions(tile_a.sequence_length, n_edits + 1)
     zarr_store = ZarrStoreByLength(length_store)
 
-    for start_a in range(tile_a.start, tile_a.end, 1000):
+    for start_a in range(tile_a.start, tile_a.end, MICRO_TILE):
         sequences_a = zarr_store.load_sequences(
             tile_a.sequence_length,
-            slice(start_a, min(start_a + 1000, tile_a.end)),
+            slice(start_a, min(start_a + MICRO_TILE, tile_a.end)),
         )
         offset_a = tile_a.offset + (start_a - tile_a.start)
-        for start_b in range(tile_b.start, tile_b.end, 1000):
+        for start_b in range(tile_b.start, tile_b.end, MICRO_TILE):
             sequences_b = zarr_store.load_sequences(
                 tile_b.sequence_length,
-                slice(start_b, min(start_b + 1000, tile_b.end)),
+                slice(start_b, min(start_b + MICRO_TILE, tile_b.end)),
             )
             offset_b = tile_b.offset + (start_b - tile_b.start)
             edges = _compute_edges_for_micro_pair(
