@@ -92,7 +92,7 @@ def run_cluster(args) -> None:
     """Build clusters by computing edges with Dask and unioning them locally."""
     start = time.time()
     unique_path = Path(args.input)
-    length_store = args.length_store or unique_path.parent / "by_length.zarr"
+    length_store = Path(args.length_store) or unique_path.parent / "by_length.zarr"
     output_path = Path(args.output)
     n_edits = args.distance
 
@@ -352,12 +352,12 @@ def compute_edges_for_pair(
     edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
     edges = DisjointSetUnion.deduplicate_edges(edges)
     logger.info(
-        "Lengths %d and %d: Found %d edges (performed %d of %d comparisons) in %.2f seconds.",
+        "Lengths %d and %d: Found %d edges (performed %s of %s comparisons) in %.2f seconds.",
         tile_spec_a.sequence_length,
         tile_spec_b.sequence_length,
         len(edges),
-        total_buckets,
-        total_pairwise,
+        format(total_buckets, ","),
+        format(total_pairwise, ","),
         elapsed,
     )
     return edges
