@@ -141,19 +141,16 @@ def run_cluster(args) -> None:
         ]
 
         # Collect results as they complete and aggregate edges
-        for i, future in enumerate(as_completed(futures)):
+        for i, (future, edges) in enumerate(as_completed(futures, with_results=True)):
             # If the remote task raised an exception, log and skip it
             exc = future.exception()
             if exc is not None:
                 logger.error("Error in task %d: %s", i + 1, str(exc))
-                logger.info("Finished task %d / %d", i + 1, len(futures))
                 future.release()
                 continue
 
-            edges = future.result()
-            logger.info("Finished task %d / %d", i + 1, len(futures))
-            for global_i, global_j in edges:
-                dsu.union(global_i, global_j)
+            logger.info("Finished task %d / %d with %d edges", i + 1, len(futures), len(edges))
+            dsu.update(edges)
             n_edges += len(edges)
             future.release()
 

@@ -61,17 +61,12 @@ cdef class DisjointSetUnion:
     def find(self, int x):
         """Find the root of the set containing x with path compression."""
         return self._find(x)
-    
-    def union(self, int a, int b):
-        """Union the sets containing a and b. Returns True if merged, False if
-        already in the same set."""
-        return self._union(a, b)
 
-    def update(self, edges, int offset_a = 0, int offset_b = 0):
+    def update(self, edges):
         """Union all pairs in edges."""
         cdef int u, v
         for u, v in edges:
-            self._union(u + offset_a, v + offset_b)
+            self._union(u, v)
 
     def get_components(self):
         """Get all components as lists of nodes."""
