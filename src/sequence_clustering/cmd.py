@@ -294,7 +294,6 @@ def create_dask_cluster(args):
             threads_per_worker=args.threads_per_worker,
         )
         logger.info("Started local Dask cluster with %d workers.", args.workers)
-        return cluster
     elif args.parallel == "lsf":
         cluster = LSFCluster(
             queue="local",
@@ -307,9 +306,11 @@ def create_dask_cluster(args):
             job_script_prologue=["export PYTHONUNBUFFERED=1"],  # unbuffer Python stdio
         )
         logger.info("Started LSF Dask cluster with %d workers.", args.workers)
-        return cluster
     else:
         raise ValueError(f"Unknown parallelism strategy: {args.parallel}")
+
+    logger.info("Dask dashboard available at %s", cluster.dashboard_link)
+    return cluster
 
 
 def load_total_counts(length_store: Path) -> dict[int, int]:
