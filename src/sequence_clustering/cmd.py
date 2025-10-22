@@ -105,7 +105,7 @@ def run_cluster(args) -> None:
     split_by_length(
         unique_path,
         length_store,
-        chunk_size=args.tile_size,
+        chunk_size=1000,
         sequence_column=args.sequence_column,
         count_column=args.count_column,
     )
@@ -114,16 +114,13 @@ def run_cluster(args) -> None:
     # Generate all sequence pairs to compare
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
-    pairs = generate_length_pairs(length_to_total_counts, n_edits, args.tile_size)
+    n_tiles = total_count // (10 * args.workers) + 1
+    tile_size = max(1, total_count // n_tiles + 1)
+    tile_size = 1000 * ((tile_size + 999) // 1000)  # round up to nearest 1000
+    pairs = generate_length_pairs(length_to_total_counts, n_edits, tile_size)
     if not pairs:
         logger.info("No length pairs within the requested distance.")
         return
-
-    # Summarize some tiles to only have ~10 * workers tasks
-    pair_groups = []
-    chunk_size = max(1, len(pairs) // (10 * args.workers))
-    for i in range(0, len(pairs), chunk_size):
-        pair_groups.append(pairs[i:i + chunk_size])
 
     dsu = DisjointSetUnion(total_count)
     n_edges = 0
@@ -133,12 +130,13 @@ def run_cluster(args) -> None:
         # Submit all length pairs as separate tasks (in tiles)
         futures = [
             client.submit(
-                compute_edges_for_all_pairs,
+                compute_edges_for_pair,
                 length_store,
-                pairs,
+                tile_a,
+                tile_b,
                 n_edits,
             )
-            for pairs in pair_groups
+            for tile_a, tile_b in pairs
         ]
 
         # Collect results as they complete and aggregate edges
@@ -311,22 +309,34 @@ def load_total_counts(length_store: Path) -> dict[int, int]:
     return length_to_total_counts
 
 
-def compute_edges_for_all_pairs(
+def compute_edges_for_pair(
     length_store: Path,
-    pairs: list[tuple[TileSpec, TileSpec]],
+    tile_a: TileSpec,
+    tile_b: TileSpec,
     n_edits: int,
 ) -> list[tuple[int, int]]:
     """Return all edges within edit distance for the given length tile pairs."""
     all_edges: list[tuple[int, int]] = []
-    for tile_spec_a, tile_spec_b in pairs:
-        edges = compute_edges_for_pair(
-            length_store,
-            tile_spec_a,
-            tile_spec_b,
-            n_edits,
+    partitions = generate_partitions(tile_a.sequence_length, n_edits + 1)
+    zarr_store = ZarrStoreByLength(length_store)
+
+    for start_a in range(tile_a.start, tile_a.end, 1000):
+        sequences_a = zarr_store.load_sequences(
+            tile_a.sequence_length,
+            slice(start_a, min(start_a + 1000, tile_a.end)),
         )
-        edges = [(a + tile_spec_a.offset, b + tile_spec_b.offset) for (a, b) in edges]
-        all_edges.extend(edges)
+        offset_a = tile_a.offset + (start_a - tile_a.start)
+        for start_b in range(tile_b.start, tile_b.end, 1000):
+            sequences_b = zarr_store.load_sequences(
+                tile_b.sequence_length,
+                slice(start_b, min(start_b + 1000, tile_b.end)),
+            )
+            offset_b = tile_b.offset + (start_b - tile_b.start)
+            edges = _compute_edges_for_micro_pair(
+                sequences_a, sequences_b, partitions, n_edits,
+            )
+            edges = [(a + offset_a, b + offset_b) for (a, b) in edges]
+            all_edges.extend(edges)
 
     # Remove duplicate edges and apply offset
     old_edges_count = len(all_edges)
@@ -335,26 +345,18 @@ def compute_edges_for_all_pairs(
 
     return all_edges
 
-def compute_edges_for_pair(
-    length_store: Path,
-    tile_spec_a: TileSpec,
-    tile_spec_b: TileSpec,
+def _compute_edges_for_micro_pair(
+    sequences_a: list[str],
+    sequences_b: list[str],
+    partitions: list[tuple[int, int]],
     n_edits: int,
 ) -> list[tuple[int, int]]:
     """Return local index pairs within edit distance between two length buckets."""
     # Read sequences of the given lengths
-    zarr_store = ZarrStoreByLength(length_store)
-    sequences_a = zarr_store.load_sequences(
-        tile_spec_a.sequence_length,
-        slice(tile_spec_a.start, tile_spec_a.end)
-    )
-    sequences_b = zarr_store.load_sequences(
-        tile_spec_b.sequence_length,
-        slice(tile_spec_b.start, tile_spec_b.end)
-    )
-    partitions = generate_partitions(tile_spec_a.sequence_length, n_edits + 1)
     edges: list[tuple[int, int]] = []
-    max_shift = min(n_edits, tile_spec_b.sequence_length - tile_spec_a.sequence_length) + 1
+    length_a = len(sequences_a[0]) if sequences_a else 0
+    length_b = len(sequences_b[0]) if sequences_b else 0
+    max_shift = min(n_edits, length_b - length_a) + 1
 
     # Generate buckets and compare within each bucket
     total_buckets = 0
@@ -382,8 +384,8 @@ def compute_edges_for_pair(
     elapsed = time.time() - start_time
     logger.info(
         "Lengths %d and %d: Found %d edges (performed %s of %s comparisons) in %.2f seconds.",
-        tile_spec_a.sequence_length,
-        tile_spec_b.sequence_length,
+        length_a,
+        length_b,
         len(edges),
         format(total_buckets, ","),
         format(total_pairwise, ","),

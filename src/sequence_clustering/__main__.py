@@ -53,12 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Column name containing sequence counts (default: count)",
     )
     cluster_parser.add_argument(
-        "--tile-size",
-        type=int,
-        default=100000,
-        help="Tile size to do pairwise comparisons on (default: 100000)",
-    )
-    cluster_parser.add_argument(
         "--workers", "-w",
         type=int,
         default=0,
