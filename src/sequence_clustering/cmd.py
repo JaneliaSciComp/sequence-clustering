@@ -1,6 +1,7 @@
 import csv
 import time
 import sys
+import math
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -112,10 +113,11 @@ def run_cluster(args) -> None:
     # Generate all sequence pairs to compare
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
-    tile_size = total_count // (3 * args.workers) + 1
+    tile_size = total_count // math.sqrt(30 * args.workers) + 1
     tile_size = 1000 * ((tile_size + 999) // 1000)  # round up to nearest 1000
     logger.info("Using tile size of %d for %d total sequences.", tile_size, total_count)
     pairs = generate_length_pairs(length_to_total_counts, n_edits, tile_size)
+    logger.info("Generated %d length pairs to process.", len(pairs))
     if not pairs:
         logger.info("No length pairs within the requested distance.")
         return
@@ -374,6 +376,7 @@ def _compute_edges_for_micro_pair(
     length_a = len(sequences_a[0]) if sequences_a else 0
     length_b = len(sequences_b[0]) if sequences_b else 0
     max_shift = min(n_edits, length_b - length_a) + 1
+    logger.info("Processing sequence pairs of length %d and %d", length_a, length_b)
 
     # Generate buckets and compare within each bucket
     total_buckets = 0
@@ -400,9 +403,7 @@ def _compute_edges_for_micro_pair(
     total_pairwise = len(sequences_a) * len(sequences_b)
     elapsed = time.time() - start_time
     logger.info(
-        "Lengths %d and %d: Found %d edges (performed %s of %s comparisons) in %.2f seconds.",
-        length_a,
-        length_b,
+        "Found %d edges (performed %s of %s comparisons) in %.2f seconds.",
         len(edges),
         format(total_buckets, ","),
         format(total_pairwise, ","),
