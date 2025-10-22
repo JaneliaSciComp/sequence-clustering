@@ -141,18 +141,22 @@ def run_cluster(args) -> None:
         ]
 
         # Collect results as they complete and aggregate edges
-        for i, (future, edges) in enumerate(as_completed(futures, with_results=True)):
-            # If the remote task raised an exception, log and skip it
-            exc = future.exception()
-            if exc is not None:
-                logger.error("Error in task %d: %s", i + 1, str(exc))
+        n_completed = 0
+        for batch in as_completed(futures).batches():
+            # Collect a batch of results; if the remote task raised an exception, skip it
+            batch_result = client.gather(batch, errors="skip")
+            for edges in batch_result:
+                n_completed += 1
+                logger.info(
+                    "Finished task %d / %d with %d edges",
+                    n_completed,
+                    len(futures),
+                    len(edges),
+                )
+                dsu.update(edges)
+                n_edges += len(edges)
+            for future in batch:
                 future.release()
-                continue
-
-            logger.info("Finished task %d / %d with %d edges", i + 1, len(futures), len(edges))
-            dsu.update(edges)
-            n_edges += len(edges)
-            future.release()
 
     # Load all read counts for cluster assembly
     logger.info("Loading count information...")
