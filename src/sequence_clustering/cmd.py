@@ -101,7 +101,6 @@ def run_cluster(args) -> None:
     n_edits = args.distance
 
     # Split sequences by length to make accessing them easier
-    logger.info("Loading unique sequences from %s...", unique_path)
     split_by_length(
         unique_path,
         length_store,
@@ -109,14 +108,13 @@ def run_cluster(args) -> None:
         sequence_column=args.sequence_column,
         count_column=args.count_column,
     )
-    logger.info("Wrote per-length Zarr store to %s", length_store)
 
     # Generate all sequence pairs to compare
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
-    n_tiles = total_count // (10 * args.workers) + 1
-    tile_size = max(1, total_count // n_tiles + 1)
+    tile_size = total_count // (10 * args.workers) + 1
     tile_size = 1000 * ((tile_size + 999) // 1000)  # round up to nearest 1000
+    logger.debug("Using tile size of %d for %d total sequences.", tile_size, total_count)
     pairs = generate_length_pairs(length_to_total_counts, n_edits, tile_size)
     if not pairs:
         logger.info("No length pairs within the requested distance.")
@@ -148,6 +146,7 @@ def run_cluster(args) -> None:
             future.release()
 
     # Load all read counts for cluster assembly
+    logger.info("Loading count information...")
     zarr_store = ZarrStoreByLength(length_store)
     counts = np.zeros(total_count, dtype=np.int64)
     sequences_flat: list[str] = []
@@ -170,6 +169,7 @@ def run_cluster(args) -> None:
         )
 
     # Assemble clusters from the union-find structure
+    logger.info("Assembling clusters...")
     components = dsu.get_components()
     clusters: list[tuple[int, int, int]] = []
     for component in components:
@@ -210,14 +210,21 @@ def split_by_length(
 ) -> None:
     """Write per-length tables into a Zarr store with a group per length."""
     # Read all sequences from the input csv file
+    logger.info("Loading unique sequences from %s...", input_file)
     sequences = read_sequences_table(
         input_file,
         sequence_column,
         count_column,
     )
+    logger.info("Loaded %s unique sequences (with %s total reads) from %s.",
+        format(len(sequences), ","),
+        format(sum(seq.count for seq in sequences), ","),
+        input_file,
+    )
 
     # Write sequences to Zarr store by length
     ZarrStoreByLength.write(sequences, output_store, chunk_size)
+    logger.info("Wrote per-length Zarr store to %s", output_store)
 
 
 def generate_length_pairs(
