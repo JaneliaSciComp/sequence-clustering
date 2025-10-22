@@ -112,9 +112,9 @@ def run_cluster(args) -> None:
     # Generate all sequence pairs to compare
     length_to_total_counts = load_total_counts(length_store)
     total_count = sum(length_to_total_counts.values())
-    tile_size = total_count // (10 * args.workers) + 1
+    tile_size = total_count // (3 * args.workers) + 1
     tile_size = 1000 * ((tile_size + 999) // 1000)  # round up to nearest 1000
-    logger.debug("Using tile size of %d for %d total sequences.", tile_size, total_count)
+    logger.info("Using tile size of %d for %d total sequences.", tile_size, total_count)
     pairs = generate_length_pairs(length_to_total_counts, n_edits, tile_size)
     if not pairs:
         logger.info("No length pairs within the requested distance.")
@@ -138,7 +138,16 @@ def run_cluster(args) -> None:
         ]
 
         # Collect results as they complete and aggregate edges
-        for i, (future, edges) in enumerate(as_completed(futures, with_results=True)):
+        for i, future in enumerate(as_completed(futures)):
+            # If the remote task raised an exception, log and skip it
+            exc = future.exception()
+            if exc is not None:
+                logger.error("Error in task %d: %s", i + 1, str(exc))
+                logger.info("Finished task %d / %d", i + 1, len(futures))
+                future.release()
+                continue
+
+            edges = future.result()
             logger.info("Finished task %d / %d", i + 1, len(futures))
             for global_i, global_j in edges:
                 dsu.union(global_i, global_j)
