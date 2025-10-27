@@ -48,26 +48,34 @@ def sequences_to_kmer_matrix(sequences: list[str], k: int) -> csr_matrix:
     return csr_matrix((values, col_indices, indptr), shape=(n_rows, dim), dtype=np.float32)
 
 
-def cosine_similarity_numpy(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compute cosine similarity via NumPy."""
+def cosine_similarity_faiss(matrix: np.ndarray, threshold: float) -> np.ndarray:
+    """Return all index pairs whose cosine similarity exceeds the threshold."""
+    start_time = time.time()
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0.0] = 1.0
     normalized = (matrix / norms).astype(np.float32, copy=False)
-
-    similarities = normalized @ normalized.T
-    indices = np.argsort(-similarities, axis=1)
-    return similarities, indices
-
-def cosine_similarity_faiss(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compute cosine similarity via FAISS IndexFlatIP."""
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms[norms == 0.0] = 1.0
-    normalized = (matrix / norms).astype(np.float32, copy=False)
+    normalize_time = time.time()
+    print(f"Normalized matrix in {normalize_time - start_time:.3f} seconds")
 
     index = faiss.IndexFlatIP(normalized.shape[1])
     index.add(normalized)
+    add_time = time.time()
+    print(f"Added vectors to FAISS index in {add_time - normalize_time:.3f} seconds")
     similarities, indices = index.search(normalized, normalized.shape[0])
-    return similarities, indices
+    search_time = time.time()
+    print(f"Searched FAISS index in {search_time - add_time:.3f} seconds")
+
+    row_ids = np.arange(normalized.shape[0])[:, None]
+    mask = (indices > row_ids) & (similarities > threshold)
+    rows, neighbor_positions = np.nonzero(mask)
+    cols = indices[rows, neighbor_positions]
+    if rows.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    edges = np.column_stack((rows.astype(np.int64), cols.astype(np.int64)))
+    edge_time = time.time()
+    print(f"Extracted edges in {edge_time - search_time:.3f} seconds")
+    return edges
+
 
 
 def main() -> None:
@@ -82,21 +90,15 @@ def main() -> None:
     print(f"Constructed k-mer matrix ({kmer_matrix.shape}, nnz={density:.3f}%) in {kmer_time - load_time:.3f} seconds")
 
     dense_matrix = kmer_matrix.toarray()
-    similarities, neighbors = cosine_similarity_faiss(dense_matrix)
+    edges = cosine_similarity_faiss(dense_matrix, THRESHOLD)
     cosine_time = time.time()
     print(f"Computed cosine similarity (FAISS flat index) in {cosine_time - kmer_time:.3f} seconds")
 
     dsu = DisjointSetUnion(len(sequences))
-    edge_count = 0
-    for row, (row_scores, row_neighbors) in enumerate(zip(similarities, neighbors), start=0):
-        for score, col in zip(row_scores, row_neighbors):
-            if col <= row:
-                continue
-            if score > THRESHOLD:
-                dsu.union(row, col)
-                edge_count += 1
+    for u, v in edges:
+        dsu.union(int(u), int(v))
 
-    print(f"Found {edge_count} pairs with similarity > {THRESHOLD}")
+    print(f"Found {len(edges)} pairs with similarity > {THRESHOLD}")
     components = dsu.get_components()
     dsu_time = time.time()
     print(f"Found {len(components)} connected components in {dsu_time - cosine_time:.3f} seconds")
