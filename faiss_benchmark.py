@@ -6,7 +6,6 @@ import time
 import faiss  # type: ignore
 import pandas as pd
 import numpy as np
-from scipy.sparse import csr_matrix
 
 from sequence_clustering.kmer import compute_kmer_counts
 from sequence_clustering.dsu import DisjointSetUnion
@@ -41,15 +40,38 @@ def sequences_to_kmer_matrix(sequences: list[str], k: int) -> np.ndarray:
     return matrix
 
 
+def cosine_similarity_brute_force(matrix: np.ndarray, threshold: float) -> np.ndarray:
+    """Return all index pairs whose cosine similarity exceeds the threshold."""
+    start_time = time.time()
+    similarities = matrix @ matrix.T
+    sim_time = time.time()
+    print(f"Computed cosine similarity matrix in {sim_time - start_time:.3f} seconds")
+
+    row_ids, col_ids = np.nonzero(similarities > threshold)
+    mask = row_ids < col_ids
+    rows = row_ids[mask]
+    cols = col_ids[mask]
+    edges = np.column_stack((rows.astype(np.int64), cols.astype(np.int64)))
+    edge_time = time.time()
+    print(f"Extracted edges in {edge_time - sim_time:.3f} seconds")
+    return edges
+
+
 def cosine_similarity_faiss(matrix: np.ndarray, threshold: float) -> np.ndarray:
     """Return all index pairs whose cosine similarity exceeds the threshold."""
     start_time = time.time()
+    n_neighbors = 64
 
+    # Flat index
     index = faiss.IndexFlatIP(matrix.shape[1])
+
+    index.train(matrix)
     index.add(matrix)
     add_time = time.time()
     print(f"Added vectors to FAISS index in {add_time - start_time:.3f} seconds")
-    similarities, indices = index.search(matrix, k=matrix.shape[0])
+
+    # Compared to knn search, ranged search is exactly what we need here
+    similarities, indices = index.search(matrix, k=n_neighbors)
     search_time = time.time()
     print(f"Searched FAISS index in {search_time - add_time:.3f} seconds")
 
